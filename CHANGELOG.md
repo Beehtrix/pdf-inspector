@@ -21,14 +21,19 @@ version and date. Earlier releases are described in their
   parentheticals that wrap onto the next line keep their usual reading
   on mirrored pages. Only right-to-left lines drawn from the page's glyphs
   vote: left-to-right lines, ActualText replacement text and pairs around
-  Latin text or punctuation alone (`(+)`) do not. A list marker such as `1)` is never paired with a
+  Latin text or punctuation alone (`(+)`) do not; separators alone (`(، )` where two
+  pairs meet) hold nothing back. A list marker such as `1)` is never paired with a
   bracket of a later pair. Known limitations: a pair split across a line
   break still leaves a stray bracket, and a mirrored page whose only
   brackets belong to parentheticals that wrap across lines may be read as
   storing brackets by role. A Latin parenthetical set directly between
   two stored-by-role pairs with a bracket of its own right beside it, as in
   `)אב( (ABC) )גד(`, may still leave pairs inverted. A bracket supplied by ActualText
-  inside such a Latin pair keeps the pair out of backwards pairing.
+  inside such a Latin pair keeps the pair out of backwards pairing, unless
+  the other bracket forms a pair stored by role with a bracket before it. A
+  replacement bracket that wraps across lines beside such a pair can still
+  leave that pair inverted when the pair is no pair around digits or
+  right-to-left letters.
 
 ## [1.27.1] - 2026-11-24
 
