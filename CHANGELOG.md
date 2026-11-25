@@ -11,29 +11,22 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
-- Parentheses in right-to-left text from InDesign's Middle Eastern edition
-  are no longer swapped. Arabic and Hebrew lines whose brackets are stored
-  under the character they were typed as (the screen line reads `)1(`)
-  came out as `الفقرة )1( و)2(`; they now read `الفقرة (1) و(2)`.
-  Pages that draw their pairs mirrored (`(1)` on screen) are unchanged.
-  The choice is made per page: a page is read this way only when more of
-  its bracket pairs read `)…(` on screen than `(…)`, so brackets of
-  parentheticals that wrap onto the next line keep their usual reading
-  on mirrored pages. Only right-to-left lines drawn from the page's glyphs
-  vote: left-to-right lines, ActualText replacement text and pairs around
-  Latin text or punctuation alone (`(+)`) do not; separators alone (`(، )` where two
-  pairs meet) hold nothing back. A list marker such as `1)` is never paired with a
-  bracket of a later pair. Known limitations: a pair split across a line
-  break still leaves a stray bracket, and a mirrored page whose only
-  brackets belong to parentheticals that wrap across lines may be read as
-  storing brackets by role. A Latin parenthetical set directly between
-  two stored-by-role pairs with a bracket of its own right beside it, as in
-  `)אב( (ABC) )גד(`, may still leave pairs inverted. A bracket supplied by ActualText
-  inside such a Latin pair keeps the pair out of backwards pairing, unless
-  the other bracket forms a pair stored by role with a bracket before it. A
-  replacement bracket that wraps across lines beside such a pair can still
-  leave that pair inverted when the pair is no pair around digits or
-  right-to-left letters.
+- Parentheses in Arabic and Hebrew text from PDFs made with InDesign's
+  Middle Eastern edition are no longer swapped. These files showed
+  `الفقرة )1( و)2(` where the document reads `الفقرة (1) و(2)`; the
+  brackets now come out the right way round. PDFs that already draw their
+  brackets mirrored are unchanged. The choice is made per page: a page is
+  read as storing brackets by their role only when more of its bracket
+  pairs read `)…(` on screen than `(…)`.
+
+Known limitations, on pages whose brackets are stored by role:
+
+- A pair split across a line break leaves a stray bracket.
+- A mirrored page whose only brackets wrap across lines may be read as
+  storing brackets by role.
+- Pairs around punctuation or separators alone, such as `(+)` or `(، )`,
+  Latin pairs next to inverted pairs, and brackets supplied by ActualText
+  beside inverted pairs can still be misread.
 
 ## [1.27.1] - 2026-11-24
 

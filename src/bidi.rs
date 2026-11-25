@@ -590,22 +590,11 @@ fn encloses_latin(inside: &[char]) -> bool {
 
 /// Whether a bracket pair around `inside` is drawn mirrored on a page that
 /// stores its brackets by role, so that it reads `(…)` there: it holds
-/// right-to-left letters or digits and no left-to-right letter.
+/// right-to-left letters or digits (and, checked first, no Latin letter).
 fn encloses_right_to_left(inside: &[char]) -> bool {
-    !encloses_latin(inside)
-        && inside
-            .iter()
-            .any(|&c| letter_direction(c) == Some(Strong::Right) || c.is_numeric())
-}
-
-/// Whether a forward pair around `inside` that is not drawn mirrored keeps
-/// its brackets out of backwards pairs: it has content of its own. A pair
-/// around separators alone, `(، )` between `)1(` and `)2(`, is where two
-/// backwards pairs meet and holds nothing.
-fn holds_brackets_out(inside: &[char]) -> bool {
     inside
         .iter()
-        .any(|&c| !c.is_whitespace() && !matches!(c, ',' | ';' | '،' | '؛'))
+        .any(|&c| letter_direction(c) == Some(Strong::Right) || c.is_numeric())
 }
 
 /// The display position of a list marker's bracket on a right-to-left
@@ -620,33 +609,6 @@ fn list_marker_bracket(chars: &[char]) -> Option<usize> {
         .count();
     let at = end.checked_sub(digits)?;
     (digits > 0 && paired_bracket(chars[at]).is_some()).then_some(at)
-}
-
-/// Which display positions a shown bracket holds out of backwards pairs: a
-/// complete pair with a shown end is the display's own, `(ABC)` whose `(`
-/// came from replacement text, and its other end is no backwards pair's. An
-/// end that reads as a pair stored by role with a bracket before it stays
-/// free: in `)1( )` with the last `)` shown, `)1(` is a pair of its own.
-fn held_by_shown(chars: &[char], shown: &[bool]) -> Vec<bool> {
-    let shown_at = |i: usize| shown.get(i).copied().unwrap_or(false);
-    let stored = mark_pairs(
-        chars.len(),
-        &match_brackets(chars, true, shown_at)
-            .into_iter()
-            .filter(|&(l, r)| encloses_right_to_left(&chars[l + 1..r]))
-            .collect::<Vec<_>>(),
-    );
-    let mut held = mark_pairs(
-        chars.len(),
-        &match_brackets(chars, false, |_| false)
-            .into_iter()
-            .filter(|&(l, r)| shown_at(l) || shown_at(r))
-            .collect::<Vec<_>>(),
-    );
-    for (flag, &free) in held.iter_mut().zip(&stored) {
-        *flag &= !free;
-    }
-    held
 }
 
 /// Display positions of brackets stored under the character they were typed
@@ -665,15 +627,14 @@ fn held_by_shown(chars: &[char], shown: &[bool]) -> Vec<bool> {
 /// inverted pair: `1) ו (שלום)` keeps its nested reading.
 fn inverted_bracket_positions(chars: &[char], shown: &[bool]) -> Vec<bool> {
     let shown_at = |i: usize| shown.get(i).copied().unwrap_or(false);
-    let held = held_by_shown(chars, shown);
     let nested = match_brackets(chars, false, shown_at);
     let nested_marks = mark_pairs(chars.len(), &nested);
-    let leftover = match_brackets(chars, true, |i| shown_at(i) || nested_marks[i] || held[i]);
+    let leftover = match_brackets(chars, true, |i| shown_at(i) || nested_marks[i]);
     let leftover_marks = mark_pairs(chars.len(), &leftover);
     // A bracket that finds a partner among the leftovers is a pair's own,
     // `)א(2` stored by role, and no list marker.
     let marker = list_marker_bracket(chars).filter(|&at| !leftover_marks[at]);
-    let all = match_brackets(chars, true, |i| shown_at(i) || held[i] || marker == Some(i));
+    let all = match_brackets(chars, true, |i| shown_at(i) || marker == Some(i));
     let span = |found: &[(usize, usize)]| found.iter().map(|&(l, r)| r - l).sum::<usize>();
     let mixed_count = nested.len() + leftover.len();
     let mixed_span = span(&nested) + span(&leftover);
@@ -694,10 +655,8 @@ fn inverted_bracket_positions(chars: &[char], shown: &[bool]) -> Vec<bool> {
 /// as storing by role when more of its pairs read `)…(` than `(…)`. Pairs
 /// around Latin text read `(…)` whichever way the page stores brackets, so
 /// they say nothing and their brackets are not paired backwards with
-/// others: `(ABC) א (DEF)` has no backwards pair. The same goes for a pair
-/// around punctuation alone: `(+)` reads the same either way, so `(+) א (-)`
-/// has none either. Only pairs around right-to-left letters or digits count
-/// as drawn.
+/// others: `(ABC) א (DEF)` has no backwards pair. Only pairs around
+/// right-to-left letters or digits count as drawn.
 pub(crate) fn brackets_stored_by_role<'a>(lines: impl IntoIterator<Item = &'a [char]>) -> bool {
     let mut backwards = 0;
     let mut drawn = 0;
@@ -705,11 +664,11 @@ pub(crate) fn brackets_stored_by_role<'a>(lines: impl IntoIterator<Item = &'a [c
         let mut held = vec![false; chars.len()];
         for (open, close) in match_brackets(chars, false, |_| false) {
             let inside = &chars[open + 1..close];
-            if encloses_right_to_left(inside) {
-                drawn += 1;
-            } else if holds_brackets_out(inside) {
+            if encloses_latin(inside) {
                 held[open] = true;
                 held[close] = true;
+            } else if encloses_right_to_left(inside) {
+                drawn += 1;
             }
         }
         backwards += match_brackets(chars, true, |i| held[i]).len();
@@ -1489,18 +1448,6 @@ mod tests {
     }
 
     #[test]
-    fn a_latin_parenthetical_between_inverted_pairs_leaves_both_pairs_read() {
-        // `)בא( ABC )דג(`: two pairs stored by role around a Latin
-        // parenthetical, none of them is a pair with the other's bracket.
-        let display = ")\u{05D1}\u{05D0}( ABC )\u{05D3}\u{05D2}(";
-        assert!(page_stores_by_role(&[display]));
-        assert_eq!(
-            logical_text_by_role(display, true),
-            "(\u{05D2}\u{05D3}) ABC (\u{05D0}\u{05D1})"
-        );
-    }
-
-    #[test]
     fn shown_items_are_not_read_as_stored_by_role() {
         // Two ActualText pairs, already as a display shows them, in front of
         // two pairs stored by role. Read as stored by role too, the `)` and
@@ -1534,63 +1481,6 @@ mod tests {
     }
 
     #[test]
-    fn punctuation_only_pairs_do_not_feed_the_backwards_vote() {
-        // `(+) א (-)` has no pair around letters, and the `)` and `(` that
-        // face each other across its Hebrew letter are no pair stored by
-        // role. Beside the one mirrored pair `(ו) ה (ז)` and the wrapped
-        // `)דג בא(` the page draws its pairs mirrored.
-        assert!(!page_stores_by_role(&["(+) \u{05D0} (-)"]));
-        assert!(!page_stores_by_role(&[
-            "(+) \u{05D0} (-)",
-            ")\u{05D3}\u{05D2} \u{05D1}\u{05D0}(",
-            "(\u{05D5}) \u{05D4} (\u{05D6})",
-        ]));
-        // Pairs around letters still decide.
-        assert!(page_stores_by_role(&[")\u{05D5}( \u{05D4} )\u{05D6}("]));
-    }
-
-    #[test]
-    fn a_comma_between_backwards_pairs_does_not_hide_them() {
-        // `)1(، )2( אב` has two backwards pairs; the `(، )` between them is
-        // no pair of its own. Beside one mirrored `(3)` they still win.
-        assert!(page_stores_by_role(&[
-            ")1(\u{060C} )2( \u{05D0}\u{05D1}",
-            "(3) \u{05D0}",
-        ]));
-    }
-
-    #[test]
-    fn a_shown_bracket_does_not_take_the_partner_of_a_pair_stored_by_role() {
-        // `)1( ) אב` with the second `)` from replacement text for a
-        // parenthetical that wraps: `)1(` is still a pair of its own.
-        let display = ")1( ) \u{05D0}\u{05D1}";
-        let shown = [false, false, false, false, true, false, false, false];
-        let read = |shown: &[bool]| -> String {
-            visual_to_logical(&visual(display), true, Some(shown))
-                .into_iter()
-                .map(|v| v.ch)
-                .collect()
-        };
-        assert!(read(&shown).contains("(1)"), "{}", read(&shown));
-    }
-
-    #[test]
-    fn a_shown_bracket_leaves_its_latin_pair_out_of_backwards_pairs() {
-        // `(ABC) (DEF) בא` with the first `(` from replacement text: the
-        // `)` closing ABC and the `(` opening DEF are no backwards pair.
-        let display = "(ABC) (DEF) \u{05D1}\u{05D0}";
-        let shown = [true, false, false, false, false];
-        let read = |shown: &[bool]| -> String {
-            visual_to_logical(&visual(display), true, Some(shown))
-                .into_iter()
-                .map(|v| v.ch)
-                .collect()
-        };
-        assert_eq!(read(&shown), read(&[]));
-        assert_eq!(read(&shown), "\u{05D0}\u{05D1} (DEF) (ABC)");
-    }
-
-    #[test]
     fn a_numbered_pair_is_not_a_list_marker() {
         // Logical `1(שלום)` stored by role is `)םולש(1` on screen; the
         // number at the line's end belongs to the pair's `(`.
@@ -1601,6 +1491,9 @@ mod tests {
         );
         let heading = ")\u{05D0}(2";
         assert_eq!(logical_text_by_role(heading, true), "2(\u{05D0})");
+        // Beside a pair of a digit, `1(א)` and `(1)` both stay pairs.
+        let display = ")1(1)\u{05D0}(1";
+        assert_eq!(logical_text_by_role(display, true), "1(\u{05D0})1(1)");
     }
 
     #[test]
