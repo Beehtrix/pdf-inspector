@@ -7,6 +7,19 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- Superscript detection no longer turns the small pieces of an Arabic or
+  Hebrew heading (the "ال" of a heading set as a separate 7 pt item, or a
+  bracket-only item such as `())`) into `<sup>` markers. They rejoin the
+  neighbouring larger RTL item as plain text, so headings like
+  `## المادة الأولى:` stay headings. Latin and CJK footnote markers are
+  unchanged; a raised bracket-only item beside non-RTL text is no longer a
+  script, and a raised Arabic or Hebrew letter marker beside a larger RTL
+  word is now read as part of that word (firecrawl/firecrawl#5931).
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.

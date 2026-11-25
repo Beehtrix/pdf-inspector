@@ -335,6 +335,18 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
                 }
             }
             if let Some((_, anchor, anchor_on_left)) = best {
+                // Brackets alone ("())") are punctuation of the neighbouring
+                // text, not a marker. Beside RTL text they are rejoined to
+                // it by `apply_script_runs`; elsewhere they are no script.
+                let only_brackets = chain.iter().all(|&i| {
+                    items[i]
+                        .text
+                        .chars()
+                        .all(|c| matches!(c, '(' | ')' | '[' | ']' | '{' | '}'))
+                });
+                if only_brackets && !has_rtl_letter(&items[anchor].text) {
+                    continue;
+                }
                 runs.push(ScriptRun {
                     glyphs: chain,
                     anchor,
@@ -366,6 +378,11 @@ fn fusable_anchor_edge(anchor: &TextItem, anchor_on_left: bool) -> bool {
             .next()
             .is_some_and(|c| c.is_alphabetic())
     }
+}
+
+fn has_rtl_letter(text: &str) -> bool {
+    text.chars()
+        .any(|c| c.is_alphabetic() && crate::text_utils::is_rtl_char(c))
 }
 
 /// Fuse digit-only runs into their anchors; flag every other run.
@@ -419,8 +436,18 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
                 && (anchor.is_underline == glyph.is_underline
                     || (anchor.is_underline && !glyph.is_underline))
         });
-        let fuse = digit_only
-            && digits <= SCRIPT_MAX_FUSED_DIGITS
+        // Small Arabic/Hebrew letters touching a larger RTL item are a
+        // piece of that word set at another size (the "ال" of an Arabic
+        // heading), not a footnote marker. They rejoin the word as plain
+        // text so the line keeps the anchor's size and stays a heading.
+        // Bracket-only pieces ("())" of the same headings) rejoin likewise.
+        let rtl_word_piece = run.glyphs.iter().all(|&g| {
+            items[g].text.chars().all(|c| {
+                (c.is_alphabetic() && crate::text_utils::is_rtl_char(c))
+                    || matches!(c, '(' | ')' | '[' | ']' | '{' | '}')
+            })
+        }) && has_rtl_letter(&anchor.text);
+        let fuse = ((digit_only && digits <= SCRIPT_MAX_FUSED_DIGITS) || rtl_word_piece)
             && marks_ok
             && fusable_anchor_edge(anchor, run.anchor_on_left)
             && !run_of_glyph.contains_key(&run.anchor);
@@ -435,7 +462,13 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             let mapped: String = run
                 .glyphs
                 .iter()
-                .map(|&g| map_script_digits(&items[g].text, raised))
+                .map(|&g| {
+                    if rtl_word_piece {
+                        items[g].text.clone()
+                    } else {
+                        map_script_digits(&items[g].text, raised)
+                    }
+                })
                 .collect();
             let run_left = items[run.glyphs[0]].x;
             let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
@@ -941,5 +974,157 @@ mod tests {
         ];
         let merged = merge_subscript_items(items);
         assert_eq!(texts(&merged), vec!["a", "b", "second"]);
+    }
+    // ---- Arabic heading regression (firecrawl/firecrawl#5931) ----
+    // The PDF sets pieces of a 14 pt heading as 7 pt items raised 4 pt and
+    // touching the heading item. They are heading text, not footnote markers.
+
+    #[test]
+    fn arabic_letters_beside_heading_rejoin_the_word() {
+        let items = vec![
+            make_item_fs("ال", 173.6707, 295.9942, 8.9199, 6.996),
+            make_item_fs("مادة الأولى:", 182.5865, 291.9982, 58.366, 14.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "المادة الأولى:");
+        assert_eq!(merged[0].baseline_shift, 0.0);
+        assert_eq!(merged[0].font_size, 14.0);
+    }
+
+    #[test]
+    fn arabic_heading_with_small_piece_stays_a_markdown_heading() {
+        use crate::markdown::{to_markdown_from_items, MarkdownOptions};
+        let mut items = Vec::new();
+        for y in [600.0_f32, 500.0] {
+            items.push(make_item_fs("ال", 173.6707, y + 4.0, 8.9199, 6.996));
+            items.push(make_item_fs("مادة الأولى:", 182.5865, y, 58.366, 14.0));
+        }
+        for y in [450.0_f32, 435.0, 420.0, 405.0] {
+            let mut body = make_item_fs("نص الفقرة العادية هنا", 100.0, y, 140.0, 10.0);
+            body.page = 1;
+            items.push(body);
+        }
+        let md = to_markdown_from_items(merge_subscript_items(items), MarkdownOptions::default());
+        assert!(md.contains("# المادة الأولى:"), "{md}");
+        assert!(!md.contains("<sup>"), "{md}");
+        assert!(!md.contains("**ال**"), "{md}");
+    }
+
+    #[test]
+    fn hebrew_letters_beside_larger_hebrew_item_rejoin_the_word() {
+        let items = vec![
+            make_item_fs("ה", 100.0, 504.0, 4.0, 6.0),
+            make_item_fs("ספר", 104.0, 500.0, 24.0, 12.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "הספר");
+    }
+
+    #[test]
+    fn raised_arabic_letter_beside_latin_text_is_still_a_script() {
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("أ", 124.0, 504.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert!(merged[1].baseline_shift > 0.0);
+    }
+
+    #[test]
+    fn latin_raised_lone_bracket_is_not_a_script() {
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("(", 124.0, 504.0, 2.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|i| i.baseline_shift == 0.0));
+    }
+
+    #[test]
+    fn bracket_only_item_beside_arabic_heading_rejoins_it() {
+        let items = vec![
+            make_item_fs("())", 159.8416, 208.9678, 8.9199, 6.996),
+            make_item_fs("المادة الثلاثون: ", 168.7574, 204.9718, 72.198, 14.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].font_size, 14.0);
+        assert_eq!(merged[0].baseline_shift, 0.0);
+    }
+
+    #[test]
+    fn arabic_word_with_raised_digit_footnote_still_fuses() {
+        let items = vec![
+            make_item_fs("كلمة", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("1", 124.0, 504.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "كلمة¹");
+    }
+
+    #[test]
+    fn latin_raised_marker_symbol_is_flagged_superscript() {
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("*", 124.0, 504.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].text, "*");
+        assert!(merged[1].baseline_shift > 0.0);
+    }
+
+    #[test]
+    fn latin_raised_ordinal_suffix_is_flagged_superscript() {
+        let items = vec![
+            make_item_fs("4", 100.0, 500.0, 6.0, 12.0),
+            make_item_fs("th", 106.0, 504.0, 6.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].text, "th");
+        assert!(merged[1].baseline_shift > 0.0);
+    }
+
+    #[test]
+    fn latin_bracketed_raised_marker_is_still_a_script() {
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("(", 124.0, 504.0, 2.0, 6.0),
+            make_item_fs("1", 126.0, 504.0, 3.0, 6.0),
+            make_item_fs(")", 129.0, 504.0, 2.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].text, "(1)");
+        assert!(merged[1].baseline_shift > 0.0);
+    }
+
+    #[test]
+    fn cjk_raised_digit_footnote_fuses() {
+        let items = vec![
+            make_item_fs("脚注", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("1", 124.0, 504.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "脚注¹");
+    }
+
+    #[test]
+    fn cjk_raised_marker_symbol_is_flagged_superscript() {
+        let items = vec![
+            make_item_fs("脚注", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("*", 124.0, 504.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].text, "*");
+        assert!(merged[1].baseline_shift > 0.0);
     }
 }
