@@ -22,7 +22,10 @@ version and date. Earlier releases are described in their
   space when a word gap separates them, and only when their bold and italic
   match. A piece touching the Latin end of a mixed-direction item stays a
   script. Pieces that cannot join keep their painted position and are not
-  flagged (firecrawl/firecrawl#5931).
+  flagged (firecrawl/firecrawl#5931). Known limits: a piece left unjoined
+  keeps its painted baseline, so it can land on its own line in Markdown, and
+  a spaced word fused into its anchor shares the anchor's bounding box. Both
+  follow from never rewriting painted coordinates.
 
 ## [1.27.1] - 2026-11-24
 

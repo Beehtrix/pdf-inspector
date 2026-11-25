@@ -474,25 +474,41 @@ fn fuse_run(items: &mut [TextItem], run: &ScriptRun, remove: &mut [bool]) {
     // to plain digits, so downstream text matching is unaffected.
     let raised = first.y > anchor.y + anchor.font_size * 0.1;
     let rtl = run.plain && facing_edge_is_rtl(anchor, run.anchor_on_left);
-    let texts = run
+    let mut texts: Vec<String> = run
         .glyphs
         .iter()
-        .map(|&g| map_script_digits(&items[g].text, raised));
-    let mapped: String = if rtl && run.anchor_on_left {
-        texts.rev().collect()
-    } else {
-        texts.collect()
-    };
+        .map(|&g| map_script_digits(&items[g].text, raised))
+        .collect();
+    // Spaces between the run's own pieces: two small words a word space
+    // apart stay two words.
+    let join_gap = anchor.font_size * SCRIPT_RTL_JOIN_GAP;
+    let mut inner: Vec<&str> = run
+        .glyphs
+        .windows(2)
+        .map(|w| {
+            let spaced = run.plain && items[w[1]].x - item_right(&items[w[0]]) > join_gap;
+            if spaced {
+                " "
+            } else {
+                ""
+            }
+        })
+        .collect();
+    if rtl && run.anchor_on_left {
+        texts.reverse();
+        inner.reverse();
+    }
+    let mut mapped = texts[0].clone();
+    for (sep, text) in inner.iter().zip(&texts[1..]) {
+        mapped.push_str(sep);
+        mapped.push_str(text);
+    }
     let gap = if run.anchor_on_left {
         first.x - item_right(anchor)
     } else {
         anchor.x - item_right(last)
     };
-    let separator = if run.plain && gap > anchor.font_size * SCRIPT_RTL_JOIN_GAP {
-        " "
-    } else {
-        ""
-    };
+    let separator = if run.plain && gap > join_gap { " " } else { "" };
     let (run_left, run_right) = (first.x, item_right(last));
     let rewrite = run.glyphs.iter().any(|&g| items[g].legacy_symbol_rewrite);
 
@@ -534,7 +550,12 @@ fn flag_run(items: &mut [TextItem], run: &ScriptRun, anchor_y: f32, remove: &mut
             .position(|&g| style(g) != style(run.glyphs[start]))
             .map_or(run.glyphs.len(), |n| start + n);
         let part = &run.glyphs[start..end];
-        let run_right = item_right(&items[*part.last().unwrap()]);
+        // A style boundary must not open a gap that line assembly reads as
+        // a word space: the part reaches the start of the next one.
+        let mut run_right = item_right(&items[*part.last().unwrap()]);
+        if let Some(&next) = run.glyphs.get(end) {
+            run_right = run_right.max(items[next].x);
+        }
         let text: String = part.iter().map(|&g| items[g].text.as_str()).collect();
         let rewrite = part.iter().any(|&g| items[g].legacy_symbol_rewrite);
         let head = &mut items[part[0]];
@@ -1165,6 +1186,31 @@ mod tests {
         let merged = merge_subscript_items(items);
         assert_eq!(merged.len(), 2);
         assert!(merged[1].baseline_shift == 0.0 && (merged[1].y - 504.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn style_boundary_inside_a_marker_adds_no_space() {
+        use crate::markdown::{to_markdown_from_items, MarkdownOptions};
+        let mut h = make_item_fs("h", 110.0, 504.0, 3.0, 6.0);
+        h.is_bold = true;
+        let items = vec![
+            make_item_fs("4", 100.0, 500.0, 6.0, 12.0),
+            make_item_fs("t", 106.0, 504.0, 3.0, 6.0),
+            h,
+        ];
+        let md = to_markdown_from_items(merge_subscript_items(items), MarkdownOptions::default());
+        assert!(!md.contains("</sup> <sup>"), "{md}");
+    }
+
+    #[test]
+    fn spaced_small_words_in_one_plain_run_keep_their_space() {
+        let items = vec![
+            make_item_fs("רק", 100.0, 504.0, 6.0, 6.0),
+            make_item_fs("של", 108.0, 504.0, 6.0, 6.0),
+            make_item_fs("כותרת", 114.0, 500.0, 30.0, 12.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(texts(&merged), vec!["רק שלכותרת"]);
     }
 
     #[test]
