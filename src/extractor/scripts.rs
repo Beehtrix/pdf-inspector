@@ -9,7 +9,7 @@
 //! rendering (`TextItem::line_y`, `TextLine::text`) consume those results.
 
 use crate::types::{ItemType, TextItem};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Merge subscript/superscript glyph runs into their parent items, or flag
 /// them with a baseline offset when they cannot be fused.
@@ -101,11 +101,6 @@ const SCRIPT_MAX_GLYPH_LETTERS: usize = 4;
 /// super/subscript characters.
 const SCRIPT_MAX_FUSED_DIGITS: usize = 4;
 
-/// Largest gap, in anchor font sizes, at which a plain-text piece (small RTL
-/// letters, brackets) joins its anchor without a space. A wider gap, up to
-/// the attachment limit, joins with one space.
-const SCRIPT_RTL_JOIN_GAP: f32 = 0.1;
-
 /// A glyph run detected as the super/subscript of `anchor`.
 #[derive(Debug)]
 struct ScriptRun {
@@ -116,9 +111,9 @@ struct ScriptRun {
     /// The anchor precedes the run ("word²") rather than following it
     /// ("¹Hong Kong").
     anchor_on_left: bool,
-    /// Not a script after all: small RTL letters of a larger RTL word, or
-    /// brackets. They join the anchor's text, or stay untouched where that is
-    /// not possible; they are never flagged as a script.
+    /// Not a script after all: small Arabic/Hebrew letters or brackets beside
+    /// a larger RTL-led word. They join the anchor's text, or stay untouched
+    /// where that is not possible; they are never flagged as a script.
     plain: bool,
 }
 
@@ -344,7 +339,13 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
                 }
             }
             if let Some((_, anchor, anchor_on_left)) = best {
-                let plain = joins_as_plain_text(items, &chain, &items[anchor], anchor_on_left);
+                let plain = is_plain_text_piece(items, &chain, &items[anchor]);
+                // Brackets alone ("())") are punctuation of the neighbouring
+                // text, not a marker, even where they cannot rejoin it.
+                let only_brackets = chain.iter().all(|&i| items[i].text.chars().all(is_bracket));
+                if only_brackets && !plain {
+                    continue;
+                }
                 runs.push(ScriptRun {
                     glyphs: chain,
                     anchor,
@@ -383,90 +384,24 @@ fn is_bracket(c: char) -> bool {
     matches!(c, '(' | ')' | '[' | ']' | '{' | '}')
 }
 
-/// Characters examined at the anchor edge by `facing_edge_is_rtl`. The text
-/// of an item is untrusted and unbounded, so the scan never walks a whole
-/// word: the edge letter of a real word sits within a few characters.
-const SCRIPT_EDGE_SCAN: usize = 16;
-
-/// Whether the letter at the anchor's edge facing the run is Arabic/Hebrew.
-/// A mixed anchor ("See ספר PDF") is judged by the side the run touches.
-/// Cost is bounded by `SCRIPT_EDGE_SCAN`, not by the length of the text.
-fn facing_edge_is_rtl(anchor: &TextItem, anchor_on_left: bool) -> bool {
-    let edge_letter = |chars: &mut dyn Iterator<Item = char>| {
-        chars
-            .take(SCRIPT_EDGE_SCAN)
-            .skip_while(|c| c.is_whitespace())
-            .take_while(|c| !c.is_whitespace())
-            .find(|c| c.is_alphabetic())
-    };
-    let facing = if anchor_on_left {
-        edge_letter(&mut anchor.text.chars().rev())
-    } else {
-        edge_letter(&mut anchor.text.chars())
-    };
-    facing.is_some_and(crate::text_utils::is_rtl_char)
-}
-
-/// Byte offset where the last whitespace-separated word of `text` starts.
-fn last_word_start(text: &str) -> usize {
-    text.trim_end()
-        .char_indices()
-        .rev()
-        .find(|(_, c)| c.is_whitespace())
-        .map_or(0, |(i, c)| i + c.len_utf8())
-}
-
-/// Byte offset where an RTL piece is inserted. A piece on the right of the
-/// anchor touches its rightmost word: the first word in logical order when
-/// the text is led by an RTL letter, the last one in "See ספר". A piece on the
-/// left is already ahead of the text in the stream order of the source PDFs,
-/// so it goes at the start.
-fn touched_word_start(text: &str, piece_on_right: bool) -> usize {
-    let rtl_led = text
-        .chars()
-        .take(SCRIPT_EDGE_SCAN)
+/// Whether the first letter of `text` is Arabic/Hebrew.
+fn is_rtl_led(text: &str) -> bool {
+    text.chars()
         .find(|c| c.is_alphabetic())
-        .is_some_and(crate::text_utils::is_rtl_char);
-    if piece_on_right && !rtl_led {
-        last_word_start(text)
-    } else {
-        0
-    }
+        .is_some_and(crate::text_utils::is_rtl_char)
 }
 
-/// Runs that are plain text, not footnote markers: brackets alone ("())" of
-/// an Arabic heading, a stray "(" raised beside a word), and small
-/// Arabic/Hebrew letters touching a larger RTL word at that word's edge (the
-/// "ال" of a heading set at another size).
-fn joins_as_plain_text(
-    items: &[TextItem],
-    glyphs: &[usize],
-    anchor: &TextItem,
-    anchor_on_left: bool,
-) -> bool {
-    let only_brackets = |g: &usize| items[*g].text.chars().all(is_bracket);
-    let rtl_piece = |g: &usize| {
-        items[*g]
-            .text
-            .chars()
-            .all(|c| is_bracket(c) || (c.is_alphabetic() && crate::text_utils::is_rtl_char(c)))
-    };
-    glyphs.iter().all(only_brackets)
-        || (facing_edge_is_rtl(anchor, anchor_on_left) && glyphs.iter().all(rtl_piece))
-}
-
-/// Strikeout boundaries block fusion (a struck word must not extend its
-/// strike over a live footnote digit, and a struck digit must not lose its
-/// own mark). An underlined anchor with an unmarked digit DOES fuse: the
-/// drawn rule easily misses the tiny digit's overlap window, and refusing
-/// costs the whole token. Visually the rule spans both. Plain-text pieces
-/// also need the anchor's bold and italic, so fusing never drops or extends
-/// emphasis.
-fn marks_compatible(anchor: &TextItem, glyph: &TextItem, plain: bool) -> bool {
-    anchor.is_strikeout == glyph.is_strikeout
-        && (anchor.is_underline == glyph.is_underline
-            || (anchor.is_underline && !glyph.is_underline))
-        && (!plain || (anchor.is_bold == glyph.is_bold && anchor.is_italic == glyph.is_italic))
+/// Small Arabic/Hebrew letters or brackets beside a larger RTL-led item are a
+/// piece of that word set at another size (the "ال" of an Arabic heading,
+/// the "())" after it), not a footnote marker.
+fn is_plain_text_piece(items: &[TextItem], glyphs: &[usize], anchor: &TextItem) -> bool {
+    is_rtl_led(&anchor.text)
+        && glyphs.iter().all(|&g| {
+            items[g]
+                .text
+                .chars()
+                .all(|c| is_bracket(c) || (c.is_alphabetic() && crate::text_utils::is_rtl_char(c)))
+        })
 }
 
 /// Whether `run` is absorbed into its anchor's text: a plain-text piece, or
@@ -482,64 +417,54 @@ fn can_fuse(items: &[TextItem], run: &ScriptRun, glyph_runs: &HashMap<usize, usi
         .glyphs
         .iter()
         .all(|&g| items[g].text.chars().all(|c| c.is_ascii_digit()));
+    // Strikeout boundaries block fusion (a struck word must not extend its
+    // strike over a live footnote digit, and a struck digit must not lose its
+    // own mark). An underlined anchor with an unmarked digit DOES fuse: the
+    // drawn rule easily misses the tiny digit's overlap window, and refusing
+    // costs the whole token. Visually the rule spans both. A plain piece also
+    // needs the anchor's bold and italic, so fusing never drops emphasis.
+    let marks_ok = run.glyphs.iter().all(|&g| {
+        let glyph = &items[g];
+        anchor.is_strikeout == glyph.is_strikeout
+            && (anchor.is_underline == glyph.is_underline
+                || (anchor.is_underline && !glyph.is_underline))
+            && (!run.plain
+                || (anchor.is_bold == glyph.is_bold && anchor.is_italic == glyph.is_italic))
+    });
     (run.plain || (digit_only && digits <= SCRIPT_MAX_FUSED_DIGITS))
-        && run
-            .glyphs
-            .iter()
-            .all(|&g| marks_compatible(anchor, &items[g], run.plain))
+        && marks_ok
         && fusable_anchor_edge(anchor, run.anchor_on_left)
         && !glyph_runs.contains_key(&run.anchor)
 }
 
 /// Absorb a run into its anchor's text. Digits become super/subscript
-/// characters; plain pieces keep their letters, with a space where the
-/// typeset gap is wider than a kern. An RTL piece on the right of its word
-/// reads right to left, so its glyphs are taken in reverse x order.
+/// characters; plain pieces keep their letters. A plain piece on the right
+/// of its word reads right to left, so it goes at the start of the text
+/// (after any opening punctuation) with its glyphs in reverse x order; one on
+/// the left is already ahead of the word in the stream order of the source
+/// PDFs and goes at the start.
 fn fuse_run(items: &mut [TextItem], run: &ScriptRun, remove: &mut [bool]) {
     let first = &items[run.glyphs[0]];
-    let last = &items[*run.glyphs.last().unwrap()];
-    let anchor = &items[run.anchor];
     // Direction from the baseline offset (y-up): raised → superscript digits
     // (footnote refs), lowered → subscript (chemistry). NFKC folds both back
     // to plain digits, so downstream text matching is unaffected.
-    let raised = first.y > anchor.y + anchor.font_size * 0.1;
-    let rtl = run.plain && facing_edge_is_rtl(anchor, run.anchor_on_left);
-    let mut texts: Vec<String> = run
-        .glyphs
+    let raised = first.y > items[run.anchor].y + items[run.anchor].font_size * 0.1;
+    let mut glyphs = run.glyphs.clone();
+    if run.plain && run.anchor_on_left {
+        glyphs.reverse();
+    }
+    let mapped: String = glyphs
         .iter()
-        .map(|&g| map_script_digits(&items[g].text, raised))
-        .collect();
-    // Spaces between the run's own pieces: two small words a word space
-    // apart stay two words.
-    let join_gap = anchor.font_size * SCRIPT_RTL_JOIN_GAP;
-    let mut inner: Vec<&str> = run
-        .glyphs
-        .windows(2)
-        .map(|w| {
-            let spaced = run.plain && items[w[1]].x - item_right(&items[w[0]]) > join_gap;
-            if spaced {
-                " "
+        .map(|&g| {
+            if run.plain {
+                items[g].text.clone()
             } else {
-                ""
+                map_script_digits(&items[g].text, raised)
             }
         })
         .collect();
-    if rtl && run.anchor_on_left {
-        texts.reverse();
-        inner.reverse();
-    }
-    let mut mapped = texts[0].clone();
-    for (sep, text) in inner.iter().zip(&texts[1..]) {
-        mapped.push_str(sep);
-        mapped.push_str(text);
-    }
-    let gap = if run.anchor_on_left {
-        first.x - item_right(anchor)
-    } else {
-        anchor.x - item_right(last)
-    };
-    let separator = if run.plain && gap > join_gap { " " } else { "" };
-    let (run_left, run_right) = (first.x, item_right(last));
+    let run_left = first.x;
+    let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
     let rewrite = run.glyphs.iter().any(|&g| items[g].legacy_symbol_rewrite);
 
     let anchor = &mut items[run.anchor];
@@ -550,59 +475,43 @@ fn fuse_run(items: &mut [TextItem], run: &ScriptRun, remove: &mut [bool]) {
     let left = anchor.x.min(run_left);
     anchor.width = anchor_right.max(run_right) - left;
     anchor.x = left;
-    // Digits and LTR pieces read in screen order. An RTL piece on the right
-    // precedes its word; one on the left is already ahead of it in the
-    // stream order of the source PDFs.
-    if run.anchor_on_left && !rtl {
-        anchor.text.push_str(separator);
+    if run.anchor_on_left && !run.plain {
         anchor.text.push_str(&mapped);
     } else {
-        // An RTL piece goes next to the word it touches, in logical order.
-        let at = if rtl {
-            touched_word_start(&anchor.text, run.anchor_on_left)
+        let at = if run.plain {
+            anchor.text.find(char::is_alphabetic).unwrap_or(0)
         } else {
             0
         };
-        anchor.text.insert_str(at, &format!("{mapped}{separator}"));
+        anchor.text.insert_str(at, &mapped);
     }
     for &g in &run.glyphs {
         remove[g] = true;
     }
 }
 
-/// Materialize a script run as ONE item per style span, so line assembly,
+/// Materialize a script run as ONE item, so line assembly,
 /// `TextLine::text` and the bindings consume the detector's decision instead
 /// of re-deriving run membership from geometry: the glyph texts concatenate
 /// in x order (a run's glyphs touch, there is no space inside "1,2,3"), the
 /// item spans the run, and `baseline_shift` records the offset from the
 /// anchor baseline. The head glyph keeps its font, style flags and mcid.
-/// Glyphs of different bold or italic stay separate items, so a style
-/// boundary inside the run survives.
 fn flag_run(items: &mut [TextItem], run: &ScriptRun, anchor_y: f32, remove: &mut [bool]) {
-    let mut start = 0;
-    while start < run.glyphs.len() {
-        let style = |g: usize| (items[g].is_bold, items[g].is_italic);
-        let end = run.glyphs[start..]
-            .iter()
-            .position(|&g| style(g) != style(run.glyphs[start]))
-            .map_or(run.glyphs.len(), |n| start + n);
-        let part = &run.glyphs[start..end];
-        let run_right = item_right(&items[*part.last().unwrap()]);
-        let text: String = part.iter().map(|&g| items[g].text.as_str()).collect();
-        let rewrite = part.iter().any(|&g| items[g].legacy_symbol_rewrite);
-        let head = &mut items[part[0]];
-        head.text = text;
-        head.legacy_symbol_rewrite = rewrite;
-        head.width = run_right - head.x;
-        head.baseline_shift = head.y - anchor_y;
-        for &g in &part[1..] {
-            remove[g] = true;
-        }
-        start = end;
+    let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
+    let text: String = run.glyphs.iter().map(|&g| items[g].text.as_str()).collect();
+    let rewrite = run.glyphs.iter().any(|&g| items[g].legacy_symbol_rewrite);
+    let head = &mut items[run.glyphs[0]];
+    head.text = text;
+    head.legacy_symbol_rewrite = rewrite;
+    head.width = run_right - head.x;
+    head.baseline_shift = head.y - anchor_y;
+    for &g in &run.glyphs[1..] {
+        remove[g] = true;
     }
 }
 
-/// Fuse digit-only runs into their anchors; flag every other run.
+/// Fuse digit-only and plain-text runs into their anchors; flag every other
+/// run.
 fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextItem> {
     // A glyph can itself anchor a smaller run (nested scripts: "x", "2",
     // "n"). Shifts are measured from the BODY baseline, so anchor chains are
@@ -630,13 +539,8 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
         .collect();
 
     let mut remove = vec![false; items.len()];
-    // One fusion per anchor side: runs come from untrusted geometry, and a
-    // repeated rewrite of one long anchor text would be quadratic.
-    let mut fused_sides: HashSet<(usize, bool)> = HashSet::new();
     for (ri, run) in runs.iter().enumerate() {
-        if can_fuse(&items, run, &run_of_glyph)
-            && fused_sides.insert((run.anchor, run.anchor_on_left))
-        {
+        if can_fuse(&items, run, &run_of_glyph) {
             fuse_run(&mut items, run, &mut remove);
         } else if !run.plain {
             flag_run(&mut items, run, body_anchor_y[ri], &mut remove);
@@ -1156,172 +1060,12 @@ mod tests {
     }
 
     #[test]
-    fn skipped_bracket_joins_the_word_line_in_markdown() {
-        use crate::markdown::{to_markdown_from_items, MarkdownOptions};
+    fn rtl_piece_goes_after_opening_punctuation_of_the_anchor() {
         let items = vec![
-            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
-            make_item_fs("(", 124.0, 504.0, 2.0, 6.0),
-        ];
-        let merged = merge_subscript_items(items);
-        assert!(merged.iter().all(|i| (i.y - 500.0).abs() < 1e-3));
-        let md = to_markdown_from_items(merged, MarkdownOptions::default());
-        let line = md.lines().find(|l| l.contains("word")).unwrap();
-        assert!(line.contains('('), "bracket on its own line: {md}");
-        assert!(!md.contains("<sup>"), "{md}");
-    }
-
-    #[test]
-    fn spaced_rtl_pieces_join_with_a_space() {
-        // 2.5 pt gap (a word space at this size) between a 6 pt word and a
-        // 12 pt word: one line of two words, not "שלכותרת".
-        let items = vec![
-            make_item_fs("של", 100.0, 504.0, 6.0, 6.0),
-            make_item_fs("כותרת", 108.5, 500.0, 30.0, 12.0),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(texts(&merged), vec!["של כותרת"]);
-        assert_eq!(merged[0].baseline_shift, 0.0);
-    }
-
-    #[test]
-    fn small_word_after_a_gap_keeps_the_word_space() {
-        let items = vec![
-            make_item_fs("ספר", 100.0, 500.0, 24.0, 12.0),
-            make_item_fs("של", 126.5, 504.0, 6.0, 6.0),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(texts(&merged), vec!["של ספר"]);
-    }
-
-    #[test]
-    fn mixed_anchor_is_judged_by_the_edge_the_marker_touches() {
-        // The marker touches the Latin end of "See ספר PDF": a script, and
-        // the anchor text is left alone.
-        let items = vec![
-            make_item_fs("See ספר PDF", 100.0, 500.0, 66.0, 12.0),
-            make_item_fs("א", 166.0, 504.0, 3.0, 6.0),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(texts(&merged), vec!["See ספר PDF", "א"]);
-        assert!(merged[1].baseline_shift > 0.0);
-        // At the Hebrew end the same piece still joins the word.
-        let items = vec![
-            make_item_fs("ספר PDF See", 100.0, 500.0, 66.0, 12.0),
-            make_item_fs("א", 97.0, 504.0, 3.0, 6.0),
-        ];
-        assert_eq!(texts(&merge_subscript_items(items)), vec!["אספר PDF See"]);
-    }
-
-    #[test]
-    fn unjoinable_bracket_keeps_its_painted_position() {
-        // Not after a letter or closing mark, so it cannot join the text;
-        // it stays a plain item at its own baseline.
-        let items = vec![
-            make_item_fs("33", 100.0, 500.0, 12.0, 12.0),
-            make_item_fs("(", 112.0, 504.0, 2.0, 6.0),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(merged.len(), 2);
-        assert!(merged[1].baseline_shift == 0.0 && (merged[1].y - 504.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn touching_style_boundary_inside_a_marker_adds_no_space() {
-        use crate::markdown::{to_markdown_from_items, MarkdownOptions};
-        let mut h = make_item_fs("h", 109.0, 504.0, 3.0, 6.0);
-        h.is_bold = true;
-        let items = vec![
-            make_item_fs("4", 100.0, 500.0, 6.0, 12.0),
-            make_item_fs("t", 106.0, 504.0, 3.0, 6.0),
-            h,
-        ];
-        let md = to_markdown_from_items(merge_subscript_items(items), MarkdownOptions::default());
-        assert!(!md.contains("</sup> <sup>"), "{md}");
-    }
-
-    #[test]
-    fn style_boundary_keeps_the_painted_bounds() {
-        let mut h = make_item_fs("h", 129.0, 504.0, 3.0, 6.0);
-        h.is_bold = true;
-        let items = vec![
-            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
-            make_item_fs("t", 124.0, 504.0, 3.0, 6.0),
-            h,
-        ];
-        let merged = merge_subscript_items(items);
-        let t = merged.iter().find(|i| i.text == "t").unwrap();
-        assert_eq!((t.x, t.width), (124.0, 3.0));
-    }
-
-    #[test]
-    fn spaced_small_words_in_one_plain_run_keep_their_space() {
-        let items = vec![
-            make_item_fs("רק", 100.0, 504.0, 6.0, 6.0),
-            make_item_fs("של", 108.0, 504.0, 6.0, 6.0),
-            make_item_fs("כותרת", 114.0, 500.0, 30.0, 12.0),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(texts(&merged), vec!["רק שלכותרת"]);
-    }
-
-    #[test]
-    fn mixed_style_marker_run_keeps_its_style_boundary() {
-        let mut dagger = make_item_fs("†", 127.0, 504.0, 3.0, 6.0);
-        dagger.is_bold = true;
-        let items = vec![
-            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
-            make_item_fs("*", 124.0, 504.0, 3.0, 6.0),
-            dagger,
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(merged.len(), 3);
-        assert_eq!((merged[1].text.as_str(), merged[1].is_bold), ("*", false));
-        assert_eq!((merged[2].text.as_str(), merged[2].is_bold), ("†", true));
-        assert!(merged[1..].iter().all(|i| i.baseline_shift > 0.0));
-    }
-
-    #[test]
-    fn edge_scan_is_bounded_by_the_edge_not_the_word_length() {
-        let long = format!("ا{}", "1".repeat(100_000));
-        let anchor = make_item_fs(&long, 100.0, 500.0, 80.0, 12.0);
-        // The only letter lies far beyond the edge window.
-        assert!(!facing_edge_is_rtl(&anchor, true));
-        let anchor = make_item_fs(
-            &long.chars().rev().collect::<String>(),
-            100.0,
-            500.0,
-            80.0,
-            12.0,
-        );
-        assert!(!facing_edge_is_rtl(&anchor, false));
-        let anchor = make_item_fs("ספר ", 100.0, 500.0, 80.0, 12.0);
-        assert!(facing_edge_is_rtl(&anchor, true));
-    }
-
-    #[test]
-    fn rtl_piece_goes_beside_the_adjoining_word_of_a_mixed_anchor() {
-        let items = vec![
-            make_item_fs("See ספר", 100.0, 500.0, 80.0, 12.0),
-            make_item_fs("ה", 180.0, 504.0, 6.0, 6.0),
-        ];
-        let merged = merge_subscript_items(items);
-        assert_eq!(texts(&merged), vec!["See הספר"]);
-    }
-
-    #[test]
-    fn rtl_piece_joins_the_word_it_touches_in_an_all_rtl_anchor() {
-        // Right edge touches the first word in logical order.
-        let items = vec![
-            make_item_fs("ספר חדש", 100.0, 500.0, 60.0, 12.0),
+            make_item_fs("(ספר חדש", 100.0, 500.0, 60.0, 12.0),
             make_item_fs("ה", 160.0, 504.0, 4.0, 6.0),
         ];
-        assert_eq!(texts(&merge_subscript_items(items)), vec!["הספר חדש"]);
-        // A left piece keeps its stream position ahead of the text.
-        let items = vec![
-            make_item_fs("ה", 96.0, 504.0, 4.0, 6.0),
-            make_item_fs("ספר חדש", 100.0, 500.0, 60.0, 12.0),
-        ];
-        assert_eq!(texts(&merge_subscript_items(items)), vec!["הספר חדש"]);
+        assert_eq!(texts(&merge_subscript_items(items)), vec!["(הספר חדש"]);
     }
 
     // ---- Arabic heading regression (firecrawl/firecrawl#5931) ----
@@ -1389,7 +1133,7 @@ mod tests {
             make_item_fs("(", 124.0, 504.0, 2.0, 6.0),
         ];
         let merged = merge_subscript_items(items);
-        assert_eq!(texts(&merged), vec!["word("]);
+        assert_eq!(merged.len(), 2);
         assert!(merged.iter().all(|i| i.baseline_shift == 0.0));
     }
 

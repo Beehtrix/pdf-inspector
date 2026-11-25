@@ -11,26 +11,17 @@ version and date. Earlier releases are described in their
 
 ### Fixed
 
-- Superscript detection no longer turns the small pieces of an Arabic or
-  Hebrew heading (the "ال" of a heading set as a separate 7 pt item, or a
-  bracket-only item such as `())`) into `<sup>` markers. They rejoin the
-  neighbouring larger RTL item as plain text, so headings like
-  `## المادة الأولى:` stay headings. Latin and CJK footnote markers are
-  unchanged. A raised bracket-only item and a small Arabic or Hebrew piece
-  that touches the Arabic/Hebrew end of a larger word are plain text, joined
-  to it in right-to-left order when the piece sits on the right, with a
-  space when a word gap separates them, and only when their bold and italic
-  match. A piece touching the Latin end of a mixed-direction item stays a
-  script. Pieces that cannot join keep their painted position and are not
-  flagged (firecrawl/firecrawl#5931). Known limits: a piece left unjoined
-  keeps its painted baseline, so it can land on its own line in Markdown, and
-  a spaced word fused into its anchor shares the anchor's bounding box. Both
-  follow from never rewriting painted coordinates. Pieces of a marker run
-  that differ in bold or italic keep their painted bounds, so a gap of 0.12
-  em or more between them renders as a space. Each side of an anchor takes
-  one fused run, and an RTL piece joins the word it touches: the first word
-  of an RTL-led anchor when it sits on the right, the last word of a mixed
-  anchor such as `See ספר`. A piece left of the anchor goes at the start.
+- Arabic and Hebrew headings no longer come out with `<sup>` markers such as
+  `## مادة الأولى:())<sup>ال</sup>`. Small Arabic or Hebrew letters and
+  bracket-only pieces that touch a larger Arabic or Hebrew item are now part
+  of that word, so the heading keeps its text, its size, and its `##`. A
+  piece on the right of its word is placed in right-to-left order, after any
+  opening punctuation. Latin and CJK footnote markers are unchanged
+  (firecrawl/firecrawl#5931).
+- Known limitations: a small piece is rejoined only when its bold and italic
+  match the larger item and the larger item starts with an Arabic or Hebrew
+  letter. Layouts with a mixed-direction anchor, a style change inside a
+  marker, or brackets that cannot join may still render as before.
 
 ## [1.27.1] - 2026-11-24
 
