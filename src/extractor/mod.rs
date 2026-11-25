@@ -2046,17 +2046,10 @@ fn glyph_run_word_gap_floor(gaps: &[f32]) -> Option<f32> {
 /// ActualText replacement (`replaced_text`, parallel to `items`) show no
 /// glyphs of the page, so they do not vote.
 fn pages_storing_brackets_by_role(
-    items: &[TextItem],
     line_groups: &[(u32, f32, Vec<&TextItem>)],
     page_rtl: &HashMap<u32, bool>,
-    replaced_text: &[bool],
+    replaced: &std::collections::HashSet<*const TextItem>,
 ) -> HashMap<u32, bool> {
-    let replaced: std::collections::HashSet<*const TextItem> = items
-        .iter()
-        .zip(replaced_text)
-        .filter(|(_, &replaced)| replaced)
-        .map(|(item, _)| item as *const TextItem)
-        .collect();
     let mut lines_by_page: HashMap<u32, Vec<Vec<char>>> = HashMap::new();
     for (page, _, group) in line_groups {
         let page_is_rtl = page_rtl.get(page).copied().unwrap_or(false);
@@ -2134,8 +2127,14 @@ fn merge_text_items_with_clips(
         })
         .collect();
 
+    let replaced: std::collections::HashSet<*const TextItem> = items
+        .iter()
+        .zip(&replaced_text)
+        .filter(|(_, &replaced)| replaced)
+        .map(|(item, _)| item as *const TextItem)
+        .collect();
     let brackets_by_role = if visual_rtl {
-        pages_storing_brackets_by_role(&items, &line_groups, &page_rtl, &replaced_text)
+        pages_storing_brackets_by_role(&line_groups, &page_rtl, &replaced)
     } else {
         HashMap::new()
     };
@@ -2236,6 +2235,10 @@ fn merge_text_items_with_clips(
                     .collect();
                 glyph_floor = glyph_run_word_gap_floor(&gaps);
             }
+            let shown_items: Vec<bool> = group
+                .iter()
+                .map(|item| replaced.contains(&(*item as *const TextItem)))
+                .collect();
             let order = crate::bidi::logical_line_order(
                 &group,
                 |i| i.text.as_str(),
@@ -2246,6 +2249,7 @@ fn merge_text_items_with_clips(
                 crate::bidi::LineDirection {
                     rtl_base,
                     brackets_by_role: brackets_by_role.get(&page).copied().unwrap_or(false),
+                    shown_items: &shown_items,
                 },
             );
             let reordered: Vec<&TextItem> = order.iter().map(|&(index, _)| group[index]).collect();
@@ -5828,6 +5832,35 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
         replacement.y = 680.0;
         let text = visual_line_text(vec![genuine, replacement], &[false, true], 700.0);
         assert!(text.contains("(1)"), "{text:?}");
+    }
+
+    #[test]
+    fn replacement_text_brackets_are_not_read_as_stored_by_role() {
+        // ActualText `(2)` runs, turned into display order like the page's
+        // own glyphs, sit on one line with pairs stored by role: the page's
+        // way of storing applies to its glyphs only.
+        let items: Vec<TextItem> = [
+            ("(2)", 100.0),
+            ("(2)", 150.0),
+            (")1(", 200.0),
+            (")1(", 250.0),
+            ("\u{05D1}", 300.0),
+        ]
+        .into_iter()
+        .map(|(text, x)| {
+            let mut item = make_merge_item(text, x, 20.0);
+            item.y = 700.0;
+            item
+        })
+        .collect();
+        let text: String =
+            merge_text_items_with_clips(items, &[], true, &[true, true, false, false, false])
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+        assert_eq!(text.matches("(1)").count(), 2, "{text:?}");
+        assert!(!text.contains(")1("), "{text:?}");
     }
 
     #[test]

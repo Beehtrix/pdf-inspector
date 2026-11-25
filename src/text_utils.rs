@@ -206,6 +206,7 @@ pub(crate) fn reorder_bidi_line<T: Clone>(
         crate::bidi::LineDirection {
             rtl_base,
             brackets_by_role: false,
+            shown_items: &[],
         },
     );
     let source: Vec<T> = items.to_vec();
@@ -751,7 +752,7 @@ pub(crate) fn fix_visual_order_rtl(
                 .chars()
                 .map(|ch| crate::bidi::VisualChar { ch, item: None })
                 .collect();
-            item.text = crate::bidi::visual_to_logical(&visual, rtl, false)
+            item.text = crate::bidi::visual_to_logical(&visual, rtl, None)
                 .into_iter()
                 .map(|v| v.ch)
                 .collect();

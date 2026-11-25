@@ -25,7 +25,9 @@ version and date. Earlier releases are described in their
   bracket of a later pair. Known limitations: a pair split across a line
   break still leaves a stray bracket, and a mirrored page whose only
   brackets belong to parentheticals that wrap across lines may be read as
-  storing brackets by role.
+  storing brackets by role. A Latin parenthetical set directly between
+  two stored-by-role pairs with a bracket of its own right beside it, as in
+  `)אב( (ABC) )גד(`, may still leave pairs inverted.
 
 ## [1.27.1] - 2026-11-24
 
