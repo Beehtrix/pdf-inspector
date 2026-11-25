@@ -534,28 +534,82 @@ fn undo_reordering(chars: &[char], level_at: &[u8]) -> (Vec<usize>, Vec<char>) {
     (logical, out_chars)
 }
 
-/// Brackets of `chars` that pair up the wrong way round, as
-/// `(closing, opening)` positions: a closing bracket on the left with its
-/// opening bracket further right. Positions for which `skip` is true are
-/// left out.
-fn inverted_pairs(chars: &[char], skip: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
-    let mut closers: Vec<(char, usize)> = Vec::new();
+/// Deepest bracket nesting matched, as in rule BD16: a line that opens more
+/// brackets than this without closing them is not scanned further. It also
+/// bounds the work per character, so matching is linear in the line.
+const MAX_BRACKET_DEPTH: usize = 63;
+
+/// Bracket pairs of `chars` as `(left, right)` display positions. Pairs
+/// match as rule BD16 has them, an opening bracket first, or with
+/// `backwards` a closing bracket first and its opening bracket further
+/// right. Positions for which `skip` is true are left out.
+fn match_brackets(
+    chars: &[char],
+    backwards: bool,
+    skip: impl Fn(usize) -> bool,
+) -> Vec<(usize, usize)> {
+    let mut starts: Vec<(char, usize)> = Vec::new();
     let mut found = Vec::new();
     for (i, &c) in chars.iter().enumerate() {
-        if skip(i) {
-            continue;
-        }
         let Some((opening, is_open)) = paired_bracket(c) else {
             continue;
         };
-        if !is_open {
-            closers.push((opening, i));
-        } else if let Some(depth) = closers.iter().rposition(|&(open, _)| open == opening) {
-            found.push((closers[depth].1, i));
-            closers.truncate(depth);
+        if skip(i) {
+            continue;
+        }
+        if is_open != backwards {
+            if starts.len() == MAX_BRACKET_DEPTH {
+                break;
+            }
+            starts.push((opening, i));
+        } else if let Some(depth) = starts.iter().rposition(|&(open, _)| open == opening) {
+            found.push((starts[depth].1, i));
+            starts.truncate(depth);
         }
     }
     found
+}
+
+/// Which of `len` positions are an end of one of `pairs`.
+fn mark_pairs(len: usize, pairs: &[(usize, usize)]) -> Vec<bool> {
+    let mut marked = vec![false; len];
+    for &(left, right) in pairs {
+        marked[left] = true;
+        marked[right] = true;
+    }
+    marked
+}
+
+/// Whether a bracket pair around `inside` reads `(…)` whichever way the page
+/// stores its brackets: it holds left-to-right letters.
+fn encloses_latin(inside: &[char]) -> bool {
+    inside
+        .iter()
+        .any(|&c| letter_direction(c) == Some(Strong::Left))
+}
+
+/// Whether a bracket pair around `inside` is drawn mirrored on a page that
+/// stores its brackets by role, so that it reads `(…)` there: it holds
+/// right-to-left letters or digits and no left-to-right letter.
+fn encloses_right_to_left(inside: &[char]) -> bool {
+    !encloses_latin(inside)
+        && inside
+            .iter()
+            .any(|&c| letter_direction(c) == Some(Strong::Right) || c.is_numeric())
+}
+
+/// The display position of a list marker's bracket on a right-to-left
+/// line: a bracket followed on screen by nothing but a number, as `1)`
+/// shows at the start of the line, which is its right end.
+fn list_marker_bracket(chars: &[char]) -> Option<usize> {
+    let end = chars.iter().rposition(|c| !c.is_whitespace())?;
+    let digits = chars[..=end]
+        .iter()
+        .rev()
+        .take_while(|c| c.is_numeric())
+        .count();
+    let at = end.checked_sub(digits)?;
+    (digits > 0 && paired_bracket(chars[at]).is_some()).then_some(at)
 }
 
 /// Display positions of brackets stored under the character they were typed
@@ -567,25 +621,22 @@ fn inverted_pairs(chars: &[char], skip: impl Fn(usize) -> bool) -> Vec<(usize, u
 /// bracket glyph a pair takes in right-to-left text under the character it
 /// was typed as, so the screen line holds `)…(` and the characters are
 /// already the logical ones: rule L4 must not be undone for them. A line is
-/// read that way when more of its brackets pair up inverted than nested
-/// (`pairs`, matched as rule BD16 does), or as many with tighter pairs: in
-/// `)a( b )c(` the middle `( b )` nests but the two inverted pairs fit
-/// better.
-fn inverted_bracket_positions(chars: &[char], pairs: &[BracketPair]) -> Vec<usize> {
-    let nested = |i: usize| pairs.iter().any(|pair| pair.open == i || pair.close == i);
-    let leftover = inverted_pairs(chars, nested);
-    let all = inverted_pairs(chars, |_| false);
-    let span = |found: &[(usize, usize)]| found.iter().map(|&(c, o)| o - c).sum::<usize>();
-    let nested_span: usize = pairs.iter().map(|pair| pair.close - pair.open).sum();
-    let mixed_count = pairs.len() + leftover.len();
-    let mixed_span = nested_span + span(&leftover);
-    let chosen = if all.len() > mixed_count || (all.len() == mixed_count && span(&all) < mixed_span)
-    {
-        all
-    } else {
-        leftover
-    };
-    chosen.into_iter().flat_map(|(c, o)| [c, o]).collect()
+/// read that way when more of its brackets pair up inverted than nested, or
+/// as many with tighter pairs: in `)a( b )c(` the middle `( b )` nests but
+/// the two inverted pairs fit better. A list marker's bracket (`1)` at the
+/// start of the line) is no part of an inverted pair: `1) ו (שלום)` keeps
+/// its nested reading.
+fn inverted_bracket_positions(chars: &[char]) -> Vec<bool> {
+    let marker = list_marker_bracket(chars);
+    let nested = match_brackets(chars, false, |_| false);
+    let nested_marks = mark_pairs(chars.len(), &nested);
+    let leftover = match_brackets(chars, true, |i| nested_marks[i] || marker == Some(i));
+    let all = match_brackets(chars, true, |i| marker == Some(i));
+    let span = |found: &[(usize, usize)]| found.iter().map(|&(l, r)| r - l).sum::<usize>();
+    let mixed_count = nested.len() + leftover.len();
+    let mixed_span = span(&nested) + span(&leftover);
+    let all_wins = all.len() > mixed_count || (all.len() == mixed_count && span(&all) < mixed_span);
+    mark_pairs(chars.len(), if all_wins { &all } else { &leftover })
 }
 
 /// Whether a page stores its brackets under the character they were typed
@@ -598,42 +649,116 @@ fn inverted_bracket_positions(chars: &[char], pairs: &[BracketPair]) -> Vec<usiz
 /// line. Either way of storing makes such false pairs only where a
 /// parenthetical wraps, while every pair kept on one line shows the page's
 /// own way: `)…(` stored by role, `(…)` drawn mirrored. So the page counts
-/// as storing by role when more of its pairs read `)…(` than `(…)`. Only
-/// pairs around right-to-left letters or digits count as `(…)`: a pair
-/// around Latin text reads `(…)` whichever way the page stores brackets.
+/// as storing by role when more of its pairs read `)…(` than `(…)`. Pairs
+/// around Latin text read `(…)` whichever way the page stores brackets, so
+/// they say nothing and their brackets are not paired backwards with
+/// others: `(ABC) א (DEF)` has no backwards pair.
 pub(crate) fn brackets_stored_by_role<'a>(lines: impl IntoIterator<Item = &'a [char]>) -> bool {
-    let mut inverted = 0;
+    let mut backwards = 0;
     let mut drawn = 0;
     for chars in lines {
-        inverted += inverted_pairs(chars, |_| false).len();
-        let mut openers: Vec<(char, usize)> = Vec::new();
-        for (i, &c) in chars.iter().enumerate() {
-            let Some((opening, is_open)) = paired_bracket(c) else {
-                continue;
-            };
-            if is_open {
-                openers.push((opening, i));
-            } else if let Some(depth) = openers.iter().rposition(|&(open, _)| open == opening) {
-                let inside = &chars[openers[depth].1 + 1..i];
-                openers.truncate(depth);
-                let right_to_left = inside
-                    .iter()
-                    .any(|&c| letter_direction(c) == Some(Strong::Right) || c.is_numeric())
-                    && !inside
-                        .iter()
-                        .any(|&c| letter_direction(c) == Some(Strong::Left));
-                if right_to_left {
-                    drawn += 1;
-                }
+        let mut latin = vec![false; chars.len()];
+        for (open, close) in match_brackets(chars, false, |_| false) {
+            let inside = &chars[open + 1..close];
+            if encloses_latin(inside) {
+                latin[open] = true;
+                latin[close] = true;
+            } else if encloses_right_to_left(inside) {
+                drawn += 1;
             }
         }
+        backwards += match_brackets(chars, true, |i| latin[i]).len();
     }
-    inverted > drawn
+    backwards > drawn
 }
 
 /// Most bracket pairs whose level is left open by the display that are
 /// tried in combination; beyond that the rule N0 reading stands.
 const MAX_OPEN_PAIRS: u32 = 4;
+
+/// The combinations of levels for the pairs the display leaves open, as bit
+/// masks over `open_pairs` pairs, those that flip the fewest first.
+fn level_readings(open_pairs: usize) -> Vec<u32> {
+    if open_pairs as u32 > MAX_OPEN_PAIRS {
+        return vec![0];
+    }
+    let mut masks: Vec<u32> = (0..1u32 << open_pairs).collect();
+    masks.sort_by_key(|mask| mask.count_ones());
+    masks
+}
+
+/// Brackets in the analysis text: read back in an RTL paragraph a pair
+/// closes first, so both glyphs are mirrored to let rule BD16 match them; a
+/// bracket without a partner is neutralized (a broken bar has its class,
+/// ON, and no partner to pair with).
+fn analysis_brackets(chars: &[char], pairs: &[BracketPair], rtl_base: bool) -> Vec<(usize, char)> {
+    let paired = mark_pairs_of(chars.len(), pairs);
+    let mut replaced: Vec<(usize, char)> = Vec::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if paired_bracket(c).is_none() {
+            continue;
+        }
+        if !paired[i] {
+            replaced.push((i, '\u{00A6}'));
+        } else if rtl_base {
+            replaced.push((i, mirror_char(c)));
+        }
+    }
+    replaced
+}
+
+/// Which display positions are an end of one of `pairs`.
+fn mark_pairs_of(len: usize, pairs: &[BracketPair]) -> Vec<bool> {
+    let ends: Vec<(usize, usize)> = pairs.iter().map(|pair| (pair.open, pair.close)).collect();
+    mark_pairs(len, &ends)
+}
+
+/// The marks that steer the pairs the display leaves open to the levels
+/// `mask` picks, as `(read-back index, mark)`. Only a pair the display
+/// leaves open needs steering; a pair fixed by its content resolves by rule
+/// N0 as it stands, and a mark ahead of it would shadow the letter rules W2
+/// and W7 read through it.
+fn steering_marks(
+    chars: &[char],
+    pairs: &[BracketPair],
+    open_pairs: &[usize],
+    mask: u32,
+    rtl_base: bool,
+    read_back_index: &[usize],
+) -> Vec<(usize, char)> {
+    let mut phantoms: Vec<(usize, char)> = Vec::new();
+    for (i, pair) in pairs.iter().enumerate() {
+        let Some(alternative) = pair.alternative else {
+            continue;
+        };
+        let flipped = open_pairs
+            .iter()
+            .position(|&open| open == i)
+            .is_some_and(|bit| mask & (1 << bit) != 0);
+        let level = if flipped { alternative } else { pair.level };
+        // The mark goes right before the bracket that opens the pair in
+        // the read-back: the closing glyph in an RTL paragraph.
+        let opener = if rtl_base { pair.close } else { pair.open };
+        phantoms.push((
+            read_back_index[opener],
+            phantom_before_pair(chars, pair, level),
+        ));
+    }
+    phantoms
+}
+
+/// `chars` with the brackets that were stored under the character they were
+/// typed as swapped to the glyph a mirrored display shows, so that the line
+/// reads like one from a page that draws its pairs mirrored (see
+/// [`inverted_bracket_positions`]).
+fn drawn_mirrored(chars: &[char]) -> Vec<char> {
+    let inverted = inverted_bracket_positions(chars);
+    chars
+        .iter()
+        .zip(inverted)
+        .map(|(&c, swap)| if swap { mirror_char(c) } else { c })
+        .collect()
+}
 
 /// The logical (reading) order of a line given in screen order.
 ///
@@ -644,7 +769,9 @@ const MAX_OPEN_PAIRS: u32 = 4;
 ///
 /// `brackets_by_role` says the page stores its brackets under the character
 /// they were typed as (see [`brackets_stored_by_role`]); only then are
-/// backwards pairs on a right-to-left line left unswapped.
+/// backwards pairs on a right-to-left line paired as they stand: they are
+/// read as the mirrored pairs they stand for before anything else is
+/// decided.
 ///
 /// Where a bracket pair could have been written at either of two levels,
 /// each reading is rendered back to display order and the first one that
@@ -657,7 +784,10 @@ pub(crate) fn visual_to_logical(
     if visual.is_empty() {
         return Vec::new();
     }
-    let chars: Vec<char> = visual.iter().map(|v| v.ch).collect();
+    let mut chars: Vec<char> = visual.iter().map(|v| v.ch).collect();
+    if rtl_base && brackets_by_role {
+        chars = drawn_mirrored(&chars);
+    }
 
     // The display line read back in the paragraph direction: the reading
     // order of everything but the embedded runs of the other direction.
@@ -672,64 +802,24 @@ pub(crate) fn visual_to_logical(
         .enumerate()
         .filter_map(|(i, pair)| pair.alternative.map(|_| i))
         .collect();
-    let readings: Vec<u32> = if open_pairs.len() as u32 > MAX_OPEN_PAIRS {
-        vec![0]
-    } else {
-        let mut masks: Vec<u32> = (0..1u32 << open_pairs.len()).collect();
-        masks.sort_by_key(|mask| mask.count_ones());
-        masks
-    };
 
     // Where each display position sits in the read-back.
     let mut read_back_index = vec![0usize; chars.len()];
     for (k, &p) in read_back.iter().enumerate() {
         read_back_index[p] = k;
     }
-    // Brackets in the analysis text: read back in an RTL paragraph a pair
-    // closes first, so both glyphs are mirrored to let rule BD16 match
-    // them; a bracket without a partner is neutralized (a broken bar has
-    // its class, ON, and no partner to pair with).
-    let mut replaced: Vec<(usize, char)> = Vec::new();
-    for (i, &c) in chars.iter().enumerate() {
-        if paired_bracket(c).is_none() {
-            continue;
-        }
-        if pairs.iter().any(|pair| pair.open == i || pair.close == i) {
-            if rtl_base {
-                replaced.push((i, mirror_char(c)));
-            }
-        } else {
-            replaced.push((i, '\u{00A6}'));
-        }
-    }
+    let replaced = analysis_brackets(&chars, &pairs, rtl_base);
 
     let mut first: Option<(Vec<usize>, Vec<char>)> = None;
-    for mask in readings {
-        // Only a pair the display leaves open needs steering; a pair fixed
-        // by its content resolves by rule N0 as it stands, and a mark ahead
-        // of it would shadow the letter rules W2 and W7 read through it.
-        let mut phantoms: Vec<(usize, char)> = Vec::new();
-        for (i, pair) in pairs.iter().enumerate() {
-            if pair.alternative.is_none() {
-                continue;
-            }
-            let flipped = open_pairs
-                .iter()
-                .position(|&open| open == i)
-                .is_some_and(|bit| mask & (1 << bit) != 0);
-            let level = if flipped {
-                pair.alternative.unwrap_or(pair.level)
-            } else {
-                pair.level
-            };
-            // The mark goes right before the bracket that opens the pair in
-            // the read-back: the closing glyph in an RTL paragraph.
-            let opener = if rtl_base { pair.close } else { pair.open };
-            phantoms.push((
-                read_back_index[opener],
-                phantom_before_pair(&chars, pair, level),
-            ));
-        }
+    for mask in level_readings(open_pairs.len()) {
+        let phantoms = steering_marks(
+            &chars,
+            &pairs,
+            &open_pairs,
+            mask,
+            rtl_base,
+            &read_back_index,
+        );
         let sequence = analysis_sequence(&chars, &read_back, rtl_base, &replaced, &phantoms);
         let level_at = resolved_levels(&sequence, rtl_base, chars.len());
         let (logical, out_chars) = undo_reordering(&chars, &level_at);
@@ -741,15 +831,7 @@ pub(crate) fn visual_to_logical(
             first = Some((logical, out_chars));
         }
     }
-    let (logical, mut out_chars) = first.unwrap_or_default();
-    if rtl_base && brackets_by_role {
-        let inverted = inverted_bracket_positions(&chars, &pairs);
-        for (out, &p) in out_chars.iter_mut().zip(&logical) {
-            if inverted.contains(&p) {
-                *out = chars[p];
-            }
-        }
-    }
+    let (logical, out_chars) = first.unwrap_or_default();
     logical
         .iter()
         .zip(out_chars)
@@ -1268,7 +1350,7 @@ mod tests {
 
     fn page_stores_by_role(texts: &[&str]) -> bool {
         let lines: Vec<Vec<char>> = texts.iter().map(|t| t.chars().collect()).collect();
-        brackets_stored_by_role(lines.iter().map(|l| l.as_slice()))
+        brackets_stored_by_role(lines.iter().map(Vec::as_slice))
     }
 
     #[test]
@@ -1295,6 +1377,51 @@ mod tests {
             logical_text(page[0], true),
             ")\u{05D0}\u{05D1} \u{05D2}\u{05D3}("
         );
+    }
+
+    #[test]
+    fn a_list_marker_is_not_paired_with_a_bracket_of_a_later_pair() {
+        // `1) ו (שלום)` drawn mirrored: the list marker's bracket and the
+        // `(` before the word are no pair, and the line reads as it does
+        // on a page that draws its brackets mirrored.
+        let logical = "1) \u{05D5} (\u{05E9}\u{05DC}\u{05D5}\u{05DD})";
+        let display = logical_to_visual(logical, true);
+        assert_eq!(logical_text(&display, true), logical);
+        assert_eq!(logical_text_by_role(&display, true), logical);
+    }
+
+    #[test]
+    fn an_inverted_pair_beside_a_latin_word_reads_as_a_mirrored_pair_does() {
+        // `ABC )DEF( בא`: the pair stored by role encloses DEF, not ABC. The
+        // line reads as `ABC (DEF) בא` does on a page that draws its pairs
+        // mirrored; the screen cannot tell that from `(DEF) ABC` read
+        // right to left, and takes the reading as one Latin phrase.
+        let display = "ABC )DEF( \u{05D1}\u{05D0}";
+        let mirrored = "ABC (DEF) \u{05D1}\u{05D0}";
+        assert_eq!(
+            logical_text_by_role(display, true),
+            logical_text(mirrored, true)
+        );
+        assert_eq!(
+            logical_text_by_role(display, true),
+            "\u{05D0}\u{05D1} ABC (DEF)"
+        );
+    }
+
+    #[test]
+    fn adjacent_latin_pairs_do_not_vote_for_brackets_stored_by_role() {
+        // `(ABC) א (DEF)`: the `)` closing one pair and the `(` opening the
+        // next look like a backwards pair, but both pairs are drawn as
+        // usual.
+        assert!(!page_stores_by_role(&["(ABC) \u{05D0} (DEF)"]));
+    }
+
+    #[test]
+    fn long_lines_of_unmatched_brackets_are_matched_in_linear_time() {
+        let line: String = ")".repeat(50_000) + &"[".repeat(50_000) + " \u{05D0}";
+        let started = std::time::Instant::now();
+        assert!(!page_stores_by_role(&[line.as_str()]));
+        assert!(started.elapsed().as_secs() < 3, "{:?}", started.elapsed());
     }
 
     #[test]

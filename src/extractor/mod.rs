@@ -1853,12 +1853,17 @@ fn accent_overlap(accent: &TextItem, run: &TextItem, end: RunEnd) -> Option<f32>
 /// parallel to `items` too, the runs whose text is a producer's ActualText
 /// replacement rather than their glyphs' decoding: such a run's characters
 /// need not stand for its glyphs one by one, so it neither gives nor takes
-/// an accent.
+/// an accent. The `replaced_text` entries of the fragments that remain are
+/// handed back with them.
 fn compose_detached_spacing_accents<'a>(
     mut items: Vec<TextItem>,
     clips: &'a [Option<clip_boundaries::ClipRect>],
     replaced_text: &[bool],
-) -> (Vec<TextItem>, Cow<'a, [Option<clip_boundaries::ClipRect>]>) {
+) -> (
+    Vec<TextItem>,
+    Cow<'a, [Option<clip_boundaries::ClipRect>]>,
+    Vec<bool>,
+) {
     let replaced = |index: usize| replaced_text.get(index).copied().unwrap_or(false);
     let mut dropped: Vec<usize> = Vec::new();
     for i in 0..items.len() {
@@ -1920,8 +1925,9 @@ fn compose_detached_spacing_accents<'a>(
             .replace_range(range, composed.encode_utf8(&mut [0; 4]));
         dropped.push(i);
     }
+    let mut replaced_text: Vec<bool> = (0..items.len()).map(replaced).collect();
     if dropped.is_empty() {
-        return (items, Cow::Borrowed(clips));
+        return (items, Cow::Borrowed(clips), replaced_text);
     }
     let mut kept = vec![true; items.len()];
     for &index in &dropped {
@@ -1939,7 +1945,13 @@ fn compose_detached_spacing_accents<'a>(
         index += 1;
         keep
     });
-    (items, Cow::Owned(clips))
+    let mut index = 0;
+    replaced_text.retain(|_| {
+        let keep = kept[index];
+        index += 1;
+        keep
+    });
+    (items, Cow::Owned(clips), replaced_text)
 }
 
 #[cfg(test)]
@@ -2027,6 +2039,50 @@ fn glyph_run_word_gap_floor(gaps: &[f32]) -> Option<f32> {
     }
 }
 
+/// On a visual-order page, whether its brackets are stored under the
+/// character they were typed as (see `bidi::brackets_stored_by_role`),
+/// judged from the glyphs of the page's right-to-left lines. A line that
+/// reads left to right, as the correction itself decides, and a run of
+/// ActualText replacement (`replaced_text`, parallel to `items`) show no
+/// glyphs of the page, so they do not vote.
+fn pages_storing_brackets_by_role(
+    items: &[TextItem],
+    line_groups: &[(u32, f32, Vec<&TextItem>)],
+    page_rtl: &HashMap<u32, bool>,
+    replaced_text: &[bool],
+) -> HashMap<u32, bool> {
+    let replaced: std::collections::HashSet<*const TextItem> = items
+        .iter()
+        .zip(replaced_text)
+        .filter(|(_, &replaced)| replaced)
+        .map(|(item, _)| item as *const TextItem)
+        .collect();
+    let mut lines_by_page: HashMap<u32, Vec<Vec<char>>> = HashMap::new();
+    for (page, _, group) in line_groups {
+        let page_is_rtl = page_rtl.get(page).copied().unwrap_or(false);
+        if !crate::text_utils::rtl_line_base(group, |i| *i, page_is_rtl) {
+            continue;
+        }
+        let mut screen: Vec<&TextItem> = group
+            .iter()
+            .copied()
+            .filter(|item| !replaced.contains(&(*item as *const TextItem)))
+            .collect();
+        screen.sort_by(|a, b| a.x.total_cmp(&b.x));
+        lines_by_page
+            .entry(*page)
+            .or_default()
+            .push(screen.iter().flat_map(|i| i.text.chars()).collect());
+    }
+    lines_by_page
+        .into_iter()
+        .map(|(page, lines)| {
+            let by_role = crate::bidi::brackets_stored_by_role(lines.iter().map(Vec::as_slice));
+            (page, by_role)
+        })
+        .collect()
+}
+
 /// Bold and plain runs are kept apart whatever said they were bold: with
 /// `PositionOptions::bold_from_weight` the weight class has already had its
 /// say in `is_bold` (see `content_stream::read_bold_from_weight`), so runs
@@ -2050,7 +2106,8 @@ fn merge_text_items_with_clips(
     // A spacing accent shown as a fragment of its own over a letter of the
     // run before or after it is composed with that letter first, so the
     // line is ordered without it.
-    let (items, owned_clips) = compose_detached_spacing_accents(items, clips, replaced_text);
+    let (items, owned_clips, replaced_text) =
+        compose_detached_spacing_accents(items, clips, replaced_text);
     let clips: &[Option<clip_boundaries::ClipRect>] = &owned_clips;
 
     // References into `items` remain stable throughout grouping and sorting.
@@ -2077,32 +2134,8 @@ fn merge_text_items_with_clips(
         })
         .collect();
 
-    // On a visual-order page, whether its brackets are stored under the
-    // character they were typed as, judged from every line of the page.
-    let brackets_by_role: HashMap<u32, bool> = if visual_rtl {
-        let mut lines_by_page: HashMap<u32, Vec<Vec<char>>> = HashMap::new();
-        for (page, _, group) in &line_groups {
-            if !group
-                .iter()
-                .any(|i| i.text.chars().any(crate::text_utils::is_rtl_char))
-            {
-                continue;
-            }
-            let mut screen: Vec<&TextItem> = group.clone();
-            screen.sort_by(|a, b| a.x.total_cmp(&b.x));
-            lines_by_page
-                .entry(*page)
-                .or_default()
-                .push(screen.iter().flat_map(|i| i.text.chars()).collect());
-        }
-        lines_by_page
-            .into_iter()
-            .map(|(page, lines)| {
-                let by_role =
-                    crate::bidi::brackets_stored_by_role(lines.iter().map(|l| l.as_slice()));
-                (page, by_role)
-            })
-            .collect()
+    let brackets_by_role = if visual_rtl {
+        pages_storing_brackets_by_role(&items, &line_groups, &page_rtl, &replaced_text)
     } else {
         HashMap::new()
     };
@@ -5710,7 +5743,7 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
             accent,
             make_merge_item("ohoku", 107.3, 33.0),
         ];
-        let (items, clips) = compose_detached_spacing_accents(items, &[None, None, None], &[]);
+        let (items, clips, _) = compose_detached_spacing_accents(items, &[None, None, None], &[]);
         assert_eq!(items.len(), 2, "{items:?}");
         assert_eq!(clips.len(), 2);
         assert_eq!(items[1].text, "\u{014D}hoku");
@@ -5772,6 +5805,45 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
             !merged.iter().any(|item| item.text.contains('\u{00E9}')),
             "{merged:?}"
         );
+    }
+
+    /// The text of the merged item holding the line at `y`, for a
+    /// visual-order page.
+    fn visual_line_text(items: Vec<TextItem>, replaced: &[bool], y: f32) -> String {
+        let merged = merge_text_items_with_clips(items, &[], true, replaced);
+        merged
+            .iter()
+            .find(|item| (item.y - y).abs() < 1.0)
+            .map(|item| item.text.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn replacement_text_does_not_vote_on_how_a_page_stores_brackets() {
+        // `)1(` is a pair stored by role. The `(2)` on the line below is a
+        // producer's ActualText, not glyphs, and must not cancel the vote.
+        let mut genuine = make_merge_item(")1( \u{05D1}\u{05D0}", 100.0, 40.0);
+        genuine.y = 700.0;
+        let mut replacement = make_merge_item("(2) \u{05D1}\u{05D0}", 100.0, 40.0);
+        replacement.y = 680.0;
+        let text = visual_line_text(vec![genuine, replacement], &[false, true], 700.0);
+        assert!(text.contains("(1)"), "{text:?}");
+    }
+
+    #[test]
+    fn a_left_to_right_line_does_not_vote_on_how_a_page_stores_brackets() {
+        // An English sentence quoting a Hebrew word holds a `(2)` that reads
+        // the same whichever way brackets are stored.
+        let mut genuine = make_merge_item(")1( \u{05D1}\u{05D0}", 100.0, 40.0);
+        genuine.y = 700.0;
+        let mut english = make_merge_item(
+            "The word (2) in this long English sentence means \u{05D1}\u{05D0}",
+            100.0,
+            300.0,
+        );
+        english.y = 680.0;
+        let text = visual_line_text(vec![genuine, english], &[], 700.0);
+        assert!(text.contains("(1)"), "{text:?}");
     }
 
     #[test]
