@@ -16,6 +16,10 @@ version and date. Earlier releases are described in their
   under the character they were typed as (the screen line reads `)1(`)
   came out as `الفقرة )1( و)2(`; they now read `الفقرة (1) و(2)`.
   Pages that draw their pairs mirrored (`(1)` on screen) are unchanged.
+  The choice is made per page: a page is read this way only when more of
+  its bracket pairs read `)…(` on screen than `(…)`, so brackets of
+  parentheticals that wrap onto the next line keep their usual reading
+  on mirrored pages.
 
 ## [1.27.1] - 2026-11-24
 

@@ -588,6 +588,49 @@ fn inverted_bracket_positions(chars: &[char], pairs: &[BracketPair]) -> Vec<usiz
     chosen.into_iter().flat_map(|(c, o)| [c, o]).collect()
 }
 
+/// Whether a page stores its brackets under the character they were typed
+/// as, judged from its right-to-left lines in screen order (`lines`, each
+/// line's characters left to right).
+///
+/// A line alone cannot tell. `)אב גד(` is a pair stored by role, and it is
+/// just as well the end of one parenthetical and the start of the next on a
+/// page that draws its pairs mirrored, each continued on a neighbouring
+/// line. Either way of storing makes such false pairs only where a
+/// parenthetical wraps, while every pair kept on one line shows the page's
+/// own way: `)…(` stored by role, `(…)` drawn mirrored. So the page counts
+/// as storing by role when more of its pairs read `)…(` than `(…)`. Only
+/// pairs around right-to-left letters or digits count as `(…)`: a pair
+/// around Latin text reads `(…)` whichever way the page stores brackets.
+pub(crate) fn brackets_stored_by_role<'a>(lines: impl IntoIterator<Item = &'a [char]>) -> bool {
+    let mut inverted = 0;
+    let mut drawn = 0;
+    for chars in lines {
+        inverted += inverted_pairs(chars, |_| false).len();
+        let mut openers: Vec<(char, usize)> = Vec::new();
+        for (i, &c) in chars.iter().enumerate() {
+            let Some((opening, is_open)) = paired_bracket(c) else {
+                continue;
+            };
+            if is_open {
+                openers.push((opening, i));
+            } else if let Some(depth) = openers.iter().rposition(|&(open, _)| open == opening) {
+                let inside = &chars[openers[depth].1 + 1..i];
+                openers.truncate(depth);
+                let right_to_left = inside
+                    .iter()
+                    .any(|&c| letter_direction(c) == Some(Strong::Right) || c.is_numeric())
+                    && !inside
+                        .iter()
+                        .any(|&c| letter_direction(c) == Some(Strong::Left));
+                if right_to_left {
+                    drawn += 1;
+                }
+            }
+        }
+    }
+    inverted > drawn
+}
+
 /// Most bracket pairs whose level is left open by the display that are
 /// tried in combination; beyond that the rule N0 reading stands.
 const MAX_OPEN_PAIRS: u32 = 4;
@@ -599,10 +642,18 @@ const MAX_OPEN_PAIRS: u32 = 4;
 /// the same characters in logical order — paired brackets un-mirrored where
 /// the display had mirrored them — with each character's item tag.
 ///
+/// `brackets_by_role` says the page stores its brackets under the character
+/// they were typed as (see [`brackets_stored_by_role`]); only then are
+/// backwards pairs on a right-to-left line left unswapped.
+///
 /// Where a bracket pair could have been written at either of two levels,
 /// each reading is rendered back to display order and the first one that
 /// reproduces the line is taken, the rule N0 reading first.
-pub(crate) fn visual_to_logical(visual: &[VisualChar], rtl_base: bool) -> Vec<VisualChar> {
+pub(crate) fn visual_to_logical(
+    visual: &[VisualChar],
+    rtl_base: bool,
+    brackets_by_role: bool,
+) -> Vec<VisualChar> {
     if visual.is_empty() {
         return Vec::new();
     }
@@ -691,7 +742,7 @@ pub(crate) fn visual_to_logical(visual: &[VisualChar], rtl_base: bool) -> Vec<Vi
         }
     }
     let (logical, mut out_chars) = first.unwrap_or_default();
-    if rtl_base {
+    if rtl_base && brackets_by_role {
         let inverted = inverted_bracket_positions(&chars, &pairs);
         for (out, &p) in out_chars.iter_mut().zip(&logical) {
             if inverted.contains(&p) {
@@ -789,6 +840,15 @@ fn joins_number(c: char) -> bool {
     )
 }
 
+/// How a line reads: its paragraph direction, and whether its page stores
+/// brackets under the character they were typed as (see
+/// [`brackets_stored_by_role`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LineDirection {
+    pub(crate) rtl_base: bool,
+    pub(crate) brackets_by_role: bool,
+}
+
 /// The logical order of a line's items.
 ///
 /// `items` are one line's items in screen order (ascending `x`);
@@ -797,7 +857,8 @@ fn joins_number(c: char) -> bool {
 /// item's text is rendered in display order where needed, the display line
 /// is inverted with [`visual_to_logical`], and the line's characters are
 /// handed back to the items: the result lists `(item index, logical text)`
-/// in reading order.
+/// in reading order. `direction` gives the paragraph direction and the
+/// page's bracket storage (see [`visual_to_logical`]).
 ///
 /// A word gap between two items in screen order puts a space into the
 /// display line for the analysis: `word_gap` is the line's own floor for
@@ -831,8 +892,12 @@ pub(crate) fn logical_line_order<T>(
     em_of: impl Fn(&T) -> f32,
     text_is_visual: impl Fn(usize) -> bool,
     word_gap: Option<f32>,
-    rtl_base: bool,
+    direction: LineDirection,
 ) -> Vec<(usize, String)> {
+    let LineDirection {
+        rtl_base,
+        brackets_by_role,
+    } = direction;
     let mut visual: Vec<VisualChar> = Vec::new();
     let mut counts: Vec<usize> = vec![0; items.len()];
     let mut prev_right: Option<f32> = None;
@@ -870,7 +935,7 @@ pub(crate) fn logical_line_order<T>(
         }));
     }
 
-    let logical = visual_to_logical(&visual, rtl_base);
+    let logical = visual_to_logical(&visual, rtl_base, brackets_by_role);
     // Where each item's letters and digits land in the logical line.
     let is_strong = |c: char| c.is_alphanumeric() && !is_combining_mark(c);
     let mut strong_positions: Vec<Vec<usize>> = vec![Vec::new(); items.len()];
@@ -988,7 +1053,15 @@ mod tests {
     }
 
     fn logical_text(display: &str, rtl_base: bool) -> String {
-        visual_to_logical(&visual(display), rtl_base)
+        visual_to_logical(&visual(display), rtl_base, false)
+            .into_iter()
+            .map(|v| v.ch)
+            .collect()
+    }
+
+    /// As [`logical_text`] for a page whose brackets are stored by role.
+    fn logical_text_by_role(display: &str, rtl_base: bool) -> String {
+        visual_to_logical(&visual(display), rtl_base, true)
             .into_iter()
             .map(|v| v.ch)
             .collect()
@@ -1133,18 +1206,18 @@ mod tests {
         // Arabic "الفقرة (1) من" and Hebrew "אב (1) גד".
         let display = "\u{0646}\u{0645} )1( \u{0629}\u{0631}\u{0642}\u{0641}\u{0644}\u{0627}";
         assert_eq!(
-            logical_text(display, true),
+            logical_text_by_role(display, true),
             "\u{0627}\u{0644}\u{0641}\u{0642}\u{0631}\u{0629} (1) \u{0645}\u{0646}"
         );
         let display = "\u{05D3}\u{05D2} )1( \u{05D1}\u{05D0}";
         assert_eq!(
-            logical_text(display, true),
+            logical_text_by_role(display, true),
             "\u{05D0}\u{05D1} (1) \u{05D2}\u{05D3}"
         );
         // Around a word, and the heading-style pair at the end of a line.
         let display = "\u{05D3}\u{05D2} )\u{05D1}\u{05D0}( \u{05D5}";
         assert_eq!(
-            logical_text(display, true),
+            logical_text_by_role(display, true),
             "\u{05D5} (\u{05D0}\u{05D1}) \u{05D2}\u{05D3}"
         );
     }
@@ -1174,7 +1247,7 @@ mod tests {
         // a pair.
         let display = ")\u{0629}\u{0633}\u{0645}\u{0627}\u{062E}\u{0644}\u{0627}( \u{0629}\u{062F}\u{0627}\u{0645}\u{0644}\u{0627} \u{0646}\u{0645} )1( \u{0629}\u{0631}\u{0642}\u{0641}\u{0644}\u{0627}";
         assert_eq!(
-            logical_text(display, true),
+            logical_text_by_role(display, true),
             "\u{0627}\u{0644}\u{0641}\u{0642}\u{0631}\u{0629} (1) \u{0645}\u{0646} \u{0627}\u{0644}\u{0645}\u{0627}\u{062F}\u{0629} (\u{0627}\u{0644}\u{062E}\u{0627}\u{0645}\u{0633}\u{0629})"
         );
     }
@@ -1186,11 +1259,66 @@ mod tests {
         // as one.
         let display = "\u{05D3}\u{05D2} (IASB) \u{05D1}\u{05D0} )1( \u{05D0}";
         assert_eq!(
-            logical_text(display, true),
+            logical_text_by_role(display, true),
             "\u{05D0} (1) \u{05D0}\u{05D1} (IASB) \u{05D2}\u{05D3}"
         );
         // A left-to-right paragraph is untouched.
-        assert_eq!(logical_text(")1( abc", false), ")1( abc");
+        assert_eq!(logical_text_by_role(")1( abc", false), ")1( abc");
+    }
+
+    fn page_stores_by_role(texts: &[&str]) -> bool {
+        let lines: Vec<Vec<char>> = texts.iter().map(|t| t.chars().collect()).collect();
+        brackets_stored_by_role(lines.iter().map(|l| l.as_slice()))
+    }
+
+    #[test]
+    fn unrelated_brackets_on_a_mirrored_page_are_unswapped_one_by_one() {
+        // `)א(` on a page that draws its pairs mirrored: the `(` closes a
+        // parenthetical from the line before, the `)` opens one going on
+        // to the next. The page's other pair reads `(1)`, so the line is
+        // read as before, each glyph mirrored back on its own.
+        let page = [")\u{05D0}(", "\u{05D3}\u{05D2} (1) \u{05D1}\u{05D0}"];
+        assert!(!page_stores_by_role(&page));
+        assert_eq!(logical_text(page[0], true), ")\u{05D0}(");
+    }
+
+    #[test]
+    fn parentheticals_wrapping_in_and_out_of_a_line_stay_apart() {
+        // `)דג בא(` on a mirrored page is the fragment `)אב גד(`: the end
+        // of one parenthetical and the start of the next, not a pair.
+        let page = [
+            ")\u{05D3}\u{05D2} \u{05D1}\u{05D0}(",
+            "(\u{05D5}) \u{05D4} (\u{05D6})",
+        ];
+        assert!(!page_stores_by_role(&page));
+        assert_eq!(
+            logical_text(page[0], true),
+            ")\u{05D0}\u{05D1} \u{05D2}\u{05D3}("
+        );
+    }
+
+    #[test]
+    fn a_page_stores_brackets_by_role_when_its_pairs_read_backwards() {
+        // Pairs reading `)…(`, as on the Saudi PDPL pages.
+        assert!(page_stores_by_role(&[")1( \u{05D1}\u{05D0}"]));
+        // The `( b )` between two backwards pairs, and a parenthetical
+        // wrapping onto the next line, are outnumbered.
+        assert!(page_stores_by_role(&[
+            ")\u{05D0}( \u{05D1} )1(",
+            "\u{05D2} )\u{05D3}",
+        ]));
+        // A Latin pair reads `(…)` either way and says nothing.
+        assert!(page_stores_by_role(&[
+            ")1( \u{05D1}",
+            "\u{05D1} (IASB) \u{05D0}",
+        ]));
+        // Pairs drawn mirrored outnumber a backwards one.
+        assert!(!page_stores_by_role(&[
+            ")1( \u{05D1}",
+            "(\u{05D0}) \u{05D1} (2)",
+        ]));
+        // No brackets, no evidence.
+        assert!(!page_stores_by_role(&["\u{05D0} \u{05D1}"]));
     }
 
     #[test]
@@ -1293,7 +1421,10 @@ mod tests {
             |_| 12.0,
             |_| true,
             None,
-            true,
+            LineDirection {
+                rtl_base: true,
+                brackets_by_role: false,
+            },
         );
         assert_eq!(
             order,
@@ -1324,7 +1455,10 @@ mod tests {
                 |_| 12.0,
                 |_| visual,
                 None,
-                true,
+                LineDirection {
+                    rtl_base: true,
+                    brackets_by_role: false,
+                },
             );
             assert_eq!(
                 order,
@@ -1353,7 +1487,10 @@ mod tests {
             |_| 12.0,
             |_| false,
             None,
-            true,
+            LineDirection {
+                rtl_base: true,
+                brackets_by_role: false,
+            },
         );
         let reading: Vec<usize> = order.iter().map(|(index, _)| *index).collect();
         assert_eq!(reading, [3, 2, 1, 0]);
@@ -1376,7 +1513,10 @@ mod tests {
             |_| 12.0,
             |_| true,
             None,
-            true,
+            LineDirection {
+                rtl_base: true,
+                brackets_by_role: false,
+            },
         );
         assert_eq!(
             order,
@@ -1413,7 +1553,10 @@ mod tests {
             |_| 10.0,
             |_| true,
             None,
-            true,
+            LineDirection {
+                rtl_base: true,
+                brackets_by_role: false,
+            },
         );
         assert_eq!(
             order,
@@ -1450,7 +1593,10 @@ mod tests {
             |_| 12.0,
             |_| false,
             None,
-            true,
+            LineDirection {
+                rtl_base: true,
+                brackets_by_role: false,
+            },
         );
         let indexes: Vec<usize> = order.iter().map(|(i, _)| *i).collect();
         assert_eq!(indexes, vec![3, 1, 2, 0]);
@@ -1612,7 +1758,7 @@ mod tests {
                 .map(|(i, &ch)| VisualChar { ch, item: Some(i) })
                 .collect();
             for rtl_base in [true, false] {
-                let logical = visual_to_logical(&visual, rtl_base);
+                let logical = visual_to_logical(&visual, rtl_base, false);
                 assert_eq!(logical.len(), text.len());
                 let mut seen: Vec<usize> = logical.iter().filter_map(|v| v.item).collect();
                 seen.sort_unstable();

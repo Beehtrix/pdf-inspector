@@ -2077,6 +2077,36 @@ fn merge_text_items_with_clips(
         })
         .collect();
 
+    // On a visual-order page, whether its brackets are stored under the
+    // character they were typed as, judged from every line of the page.
+    let brackets_by_role: HashMap<u32, bool> = if visual_rtl {
+        let mut lines_by_page: HashMap<u32, Vec<Vec<char>>> = HashMap::new();
+        for (page, _, group) in &line_groups {
+            if !group
+                .iter()
+                .any(|i| i.text.chars().any(crate::text_utils::is_rtl_char))
+            {
+                continue;
+            }
+            let mut screen: Vec<&TextItem> = group.clone();
+            screen.sort_by(|a, b| a.x.total_cmp(&b.x));
+            lines_by_page
+                .entry(*page)
+                .or_default()
+                .push(screen.iter().flat_map(|i| i.text.chars()).collect());
+        }
+        lines_by_page
+            .into_iter()
+            .map(|(page, lines)| {
+                let by_role =
+                    crate::bidi::brackets_stored_by_role(lines.iter().map(|l| l.as_slice()));
+                (page, by_role)
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
     /// One line's fragments, in the order they are walked.
     struct LineGroup<'a> {
         page: u32,
@@ -2180,7 +2210,10 @@ fn merge_text_items_with_clips(
                 |i| i.font_size,
                 |_| visual_rtl,
                 glyph_floor,
-                rtl_base,
+                crate::bidi::LineDirection {
+                    rtl_base,
+                    brackets_by_role: brackets_by_role.get(&page).copied().unwrap_or(false),
+                },
             );
             let reordered: Vec<&TextItem> = order.iter().map(|&(index, _)| group[index]).collect();
             display_index = order.iter().map(|&(index, _)| index).collect();
