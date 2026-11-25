@@ -7,6 +7,16 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- Parentheses in right-to-left text from InDesign's Middle Eastern edition
+  are no longer swapped. Arabic and Hebrew lines whose brackets are stored
+  under the character they were typed as (the screen line reads `)1(`)
+  came out as `الفقرة )1( و)2(`; they now read `الفقرة (1) و(2)`.
+  Pages that draw their pairs mirrored (`(1)` on screen) are unchanged.
+
 ## [1.27.1] - 2026-11-24
 
 Changes since 1.27.0.

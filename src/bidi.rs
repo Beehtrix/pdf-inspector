@@ -534,6 +534,60 @@ fn undo_reordering(chars: &[char], level_at: &[u8]) -> (Vec<usize>, Vec<char>) {
     (logical, out_chars)
 }
 
+/// Brackets of `chars` that pair up the wrong way round, as
+/// `(closing, opening)` positions: a closing bracket on the left with its
+/// opening bracket further right. Positions for which `skip` is true are
+/// left out.
+fn inverted_pairs(chars: &[char], skip: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
+    let mut closers: Vec<(char, usize)> = Vec::new();
+    let mut found = Vec::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if skip(i) {
+            continue;
+        }
+        let Some((opening, is_open)) = paired_bracket(c) else {
+            continue;
+        };
+        if !is_open {
+            closers.push((opening, i));
+        } else if let Some(depth) = closers.iter().rposition(|&(open, _)| open == opening) {
+            found.push((closers[depth].1, i));
+            closers.truncate(depth);
+        }
+    }
+    found
+}
+
+/// Display positions of brackets stored under the character they were typed
+/// as, so that a pair reads `)…(` on screen although its glyphs are drawn
+/// mirrored.
+///
+/// A right-to-left line that shows its pairs mirrored reads `(…)` on screen.
+/// Some producers (InDesign's Middle Eastern edition among them) store the
+/// bracket glyph a pair takes in right-to-left text under the character it
+/// was typed as, so the screen line holds `)…(` and the characters are
+/// already the logical ones: rule L4 must not be undone for them. A line is
+/// read that way when more of its brackets pair up inverted than nested
+/// (`pairs`, matched as rule BD16 does), or as many with tighter pairs: in
+/// `)a( b )c(` the middle `( b )` nests but the two inverted pairs fit
+/// better.
+fn inverted_bracket_positions(chars: &[char], pairs: &[BracketPair]) -> Vec<usize> {
+    let nested = |i: usize| pairs.iter().any(|pair| pair.open == i || pair.close == i);
+    let leftover = inverted_pairs(chars, nested);
+    let all = inverted_pairs(chars, |_| false);
+    let span = |found: &[(usize, usize)]| found.iter().map(|&(c, o)| o - c).sum::<usize>();
+    let nested_span: usize = pairs.iter().map(|pair| pair.close - pair.open).sum();
+    let mixed_count = pairs.len() + leftover.len();
+    let mixed_span = nested_span + span(&leftover);
+    let chosen = if all.len() > mixed_count || (all.len() == mixed_count && span(&all) < mixed_span)
+    {
+        all
+    } else {
+        leftover
+    };
+    chosen.into_iter().flat_map(|(c, o)| [c, o]).collect()
+}
+
 /// Most bracket pairs whose level is left open by the display that are
 /// tried in combination; beyond that the rule N0 reading stands.
 const MAX_OPEN_PAIRS: u32 = 4;
@@ -636,7 +690,15 @@ pub(crate) fn visual_to_logical(visual: &[VisualChar], rtl_base: bool) -> Vec<Vi
             first = Some((logical, out_chars));
         }
     }
-    let (logical, out_chars) = first.unwrap_or_default();
+    let (logical, mut out_chars) = first.unwrap_or_default();
+    if rtl_base {
+        let inverted = inverted_bracket_positions(&chars, &pairs);
+        for (out, &p) in out_chars.iter_mut().zip(&logical) {
+            if inverted.contains(&p) {
+                *out = chars[p];
+            }
+        }
+    }
     logical
         .iter()
         .zip(out_chars)
@@ -1061,6 +1123,74 @@ mod tests {
             logical_text(&logical_to_visual(logical, true), true),
             logical
         );
+    }
+
+    #[test]
+    fn brackets_stored_by_logical_role_are_not_mirrored_again() {
+        // The screen line holds `)1(`: the producer stored each bracket
+        // under the character it was typed as, so the characters are the
+        // logical ones already and reading them back must not swap them.
+        // Arabic "الفقرة (1) من" and Hebrew "אב (1) גד".
+        let display = "\u{0646}\u{0645} )1( \u{0629}\u{0631}\u{0642}\u{0641}\u{0644}\u{0627}";
+        assert_eq!(
+            logical_text(display, true),
+            "\u{0627}\u{0644}\u{0641}\u{0642}\u{0631}\u{0629} (1) \u{0645}\u{0646}"
+        );
+        let display = "\u{05D3}\u{05D2} )1( \u{05D1}\u{05D0}";
+        assert_eq!(
+            logical_text(display, true),
+            "\u{05D0}\u{05D1} (1) \u{05D2}\u{05D3}"
+        );
+        // Around a word, and the heading-style pair at the end of a line.
+        let display = "\u{05D3}\u{05D2} )\u{05D1}\u{05D0}( \u{05D5}";
+        assert_eq!(
+            logical_text(display, true),
+            "\u{05D5} (\u{05D0}\u{05D1}) \u{05D2}\u{05D3}"
+        );
+    }
+
+    #[test]
+    fn brackets_already_drawn_mirrored_are_not_swapped() {
+        // The screen line holds `(1)` — mirrored glyphs, as a shaping
+        // engine draws them — and the logical text is `(1)` too. Reading
+        // it back must give the same pair, not `)1(`.
+        let display = "\u{05D3}\u{05D2} (1) \u{05D1}\u{05D0}";
+        assert_eq!(
+            logical_text(display, true),
+            "\u{05D0}\u{05D1} (1) \u{05D2}\u{05D3}"
+        );
+        // Two pairs side by side, as in "الفقرة (1) و(2)".
+        let display = "(2) \u{05D5}(1) \u{05D1}\u{05D0}";
+        assert_eq!(
+            logical_text(display, true),
+            "\u{05D0}\u{05D1} (1)\u{05D5} (2)"
+        );
+    }
+
+    #[test]
+    fn several_inverted_pairs_on_a_line_are_each_read_as_a_pair() {
+        // "الفقرة (1) من المادة (الخامسة)": the `(` ending the first pair
+        // and the `)` opening the second nest on screen, but they are not
+        // a pair.
+        let display = ")\u{0629}\u{0633}\u{0645}\u{0627}\u{062E}\u{0644}\u{0627}( \u{0629}\u{062F}\u{0627}\u{0645}\u{0644}\u{0627} \u{0646}\u{0645} )1( \u{0629}\u{0631}\u{0642}\u{0641}\u{0644}\u{0627}";
+        assert_eq!(
+            logical_text(display, true),
+            "\u{0627}\u{0644}\u{0641}\u{0642}\u{0631}\u{0629} (1) \u{0645}\u{0646} \u{0627}\u{0644}\u{0645}\u{0627}\u{062F}\u{0629} (\u{0627}\u{0644}\u{062E}\u{0627}\u{0645}\u{0633}\u{0629})"
+        );
+    }
+
+    #[test]
+    fn mixed_direction_lines_keep_their_latin_brackets() {
+        // A Latin pair inside an RTL line is nested on screen and stays
+        // that way, while a pair stored by logical role beside it is read
+        // as one.
+        let display = "\u{05D3}\u{05D2} (IASB) \u{05D1}\u{05D0} )1( \u{05D0}";
+        assert_eq!(
+            logical_text(display, true),
+            "\u{05D0} (1) \u{05D0}\u{05D1} (IASB) \u{05D2}\u{05D3}"
+        );
+        // A left-to-right paragraph is untouched.
+        assert_eq!(logical_text(")1( abc", false), ")1( abc");
     }
 
     #[test]
