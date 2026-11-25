@@ -9,7 +9,7 @@
 //! rendering (`TextItem::line_y`, `TextLine::text`) consume those results.
 
 use crate::types::{ItemType, TextItem};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Merge subscript/superscript glyph runs into their parent items, or flag
 /// them with a baseline offset when they cannot be fused.
@@ -241,6 +241,7 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
     pages.sort_by_key(|(page, _)| *page);
 
     let mut runs = Vec::new();
+    let mut skipped_brackets: HashSet<usize> = HashSet::new();
     for (_, mut by_y) in pages {
         by_y.sort_by(|&a, &b| items[a].y.total_cmp(&items[b].y));
         let max_fs = by_y
@@ -344,6 +345,7 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
                 // text, not a marker, even where they cannot rejoin it.
                 let only_brackets = chain.iter().all(|&i| items[i].text.chars().all(is_bracket));
                 if only_brackets && !plain {
+                    skipped_brackets.extend(chain);
                     continue;
                 }
                 runs.push(ScriptRun {
@@ -355,6 +357,9 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
             }
         }
     }
+    // A skipped bracket is punctuation, so a digit beside it belongs to the
+    // word the bracket belongs to, not to the bracket.
+    runs.retain(|run| !skipped_brackets.contains(&run.anchor));
     runs
 }
 
@@ -1135,6 +1140,20 @@ mod tests {
         let merged = merge_subscript_items(items);
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().all(|i| i.baseline_shift == 0.0));
+    }
+
+    #[test]
+    fn footnote_digit_beside_skipped_bracket_stays_with_its_word() {
+        // The "1" is too small to attach to the 12 pt word, but it does touch
+        // the raised ")" . The skipped bracket must not take the digit.
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs(")", 124.0, 504.0, 2.0, 6.0),
+            make_item_fs("1", 126.0, 505.0, 2.0, 3.0),
+        ];
+        let merged = merge_subscript_items(items);
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["word", ")", "1"]);
     }
 
     #[test]
