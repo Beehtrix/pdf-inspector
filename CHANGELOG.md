@@ -25,7 +25,11 @@ version and date. Earlier releases are described in their
   flagged (firecrawl/firecrawl#5931). Known limits: a piece left unjoined
   keeps its painted baseline, so it can land on its own line in Markdown, and
   a spaced word fused into its anchor shares the anchor's bounding box. Both
-  follow from never rewriting painted coordinates.
+  follow from never rewriting painted coordinates. Pieces of a marker run
+  that differ in bold or italic keep their painted bounds, so a gap of 0.12
+  em or more between them renders as a space. Each side of an anchor takes
+  one fused run, and an RTL piece joins the word it touches in a mixed
+  anchor.
 
 ## [1.27.1] - 2026-11-24
 
