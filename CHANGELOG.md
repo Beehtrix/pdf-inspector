@@ -28,8 +28,9 @@ version and date. Earlier releases are described in their
   follow from never rewriting painted coordinates. Pieces of a marker run
   that differ in bold or italic keep their painted bounds, so a gap of 0.12
   em or more between them renders as a space. Each side of an anchor takes
-  one fused run, and an RTL piece joins the word it touches in a mixed
-  anchor.
+  one fused run, and an RTL piece joins the word it touches: the first word
+  of an RTL-led anchor when it sits on the right, the last word of a mixed
+  anchor such as `See ספר`. A piece left of the anchor goes at the start.
 
 ## [1.27.1] - 2026-11-24
 

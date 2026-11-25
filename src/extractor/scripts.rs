@@ -416,6 +416,24 @@ fn last_word_start(text: &str) -> usize {
         .map_or(0, |(i, c)| i + c.len_utf8())
 }
 
+/// Byte offset where an RTL piece is inserted. A piece on the right of the
+/// anchor touches its rightmost word: the first word in logical order when
+/// the text is led by an RTL letter, the last one in "See ספר". A piece on the
+/// left is already ahead of the text in the stream order of the source PDFs,
+/// so it goes at the start.
+fn touched_word_start(text: &str, piece_on_right: bool) -> usize {
+    let rtl_led = text
+        .chars()
+        .take(SCRIPT_EDGE_SCAN)
+        .find(|c| c.is_alphabetic())
+        .is_some_and(crate::text_utils::is_rtl_char);
+    if piece_on_right && !rtl_led {
+        last_word_start(text)
+    } else {
+        0
+    }
+}
+
 /// Runs that are plain text, not footnote markers: brackets alone ("())" of
 /// an Arabic heading, a stray "(" raised beside a word), and small
 /// Arabic/Hebrew letters touching a larger RTL word at that word's edge (the
@@ -539,10 +557,9 @@ fn fuse_run(items: &mut [TextItem], run: &ScriptRun, remove: &mut [bool]) {
         anchor.text.push_str(separator);
         anchor.text.push_str(&mapped);
     } else {
-        // An RTL piece beside a mixed anchor goes next to the word it
-        // touches ("See ספר" + "ה" reads "See הספר"), not before the text.
-        let at = if rtl && run.anchor_on_left {
-            last_word_start(&anchor.text)
+        // An RTL piece goes next to the word it touches, in logical order.
+        let at = if rtl {
+            touched_word_start(&anchor.text, run.anchor_on_left)
         } else {
             0
         };
@@ -1289,6 +1306,22 @@ mod tests {
         ];
         let merged = merge_subscript_items(items);
         assert_eq!(texts(&merged), vec!["See הספר"]);
+    }
+
+    #[test]
+    fn rtl_piece_joins_the_word_it_touches_in_an_all_rtl_anchor() {
+        // Right edge touches the first word in logical order.
+        let items = vec![
+            make_item_fs("ספר חדש", 100.0, 500.0, 60.0, 12.0),
+            make_item_fs("ה", 160.0, 504.0, 4.0, 6.0),
+        ];
+        assert_eq!(texts(&merge_subscript_items(items)), vec!["הספר חדש"]);
+        // A left piece keeps its stream position ahead of the text.
+        let items = vec![
+            make_item_fs("ה", 96.0, 504.0, 4.0, 6.0),
+            make_item_fs("ספר חדש", 100.0, 500.0, 60.0, 12.0),
+        ];
+        assert_eq!(texts(&merge_subscript_items(items)), vec!["הספר חדש"]);
     }
 
     // ---- Arabic heading regression (firecrawl/firecrawl#5931) ----
