@@ -101,6 +101,11 @@ const SCRIPT_MAX_GLYPH_LETTERS: usize = 4;
 /// super/subscript characters.
 const SCRIPT_MAX_FUSED_DIGITS: usize = 4;
 
+/// Largest gap, in anchor font sizes, at which a small RTL piece still joins
+/// its word without a space. Superscripts may sit further off
+/// (`SCRIPT_ATTACH_GAP`); a wider gap between RTL words marks a space.
+const SCRIPT_RTL_JOIN_GAP: f32 = 0.1;
+
 /// A glyph run detected as the super/subscript of `anchor`.
 #[derive(Debug)]
 struct ScriptRun {
@@ -111,6 +116,9 @@ struct ScriptRun {
     /// The anchor precedes the run ("word²") rather than following it
     /// ("¹Hong Kong").
     anchor_on_left: bool,
+    /// Not a script after all: the glyphs stay separate plain items, moved onto
+    /// the anchor's baseline so they share its line.
+    plain: bool,
 }
 
 /// Items that can take part in script detection, as glyph or anchor.
@@ -337,20 +345,20 @@ fn detect_script_runs(items: &[TextItem]) -> Vec<ScriptRun> {
             if let Some((_, anchor, anchor_on_left)) = best {
                 // Brackets alone ("())") are punctuation of the neighbouring
                 // text, not a marker. Beside RTL text they are rejoined to
-                // it by `apply_script_runs`; elsewhere they are no script.
+                // it by `apply_script_runs`; elsewhere they are no script,
+                // and stay plain text on the neighbour's line.
                 let only_brackets = chain.iter().all(|&i| {
                     items[i]
                         .text
                         .chars()
                         .all(|c| matches!(c, '(' | ')' | '[' | ']' | '{' | '}'))
                 });
-                if only_brackets && !has_rtl_letter(&items[anchor].text) {
-                    continue;
-                }
+                let plain = only_brackets && !has_rtl_letter(&items[anchor].text);
                 runs.push(ScriptRun {
                     glyphs: chain,
                     anchor,
                     anchor_on_left,
+                    plain,
                 });
             }
         }
@@ -480,6 +488,21 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
                     || (anchor.is_underline && !glyph.is_underline))
         });
         let rtl_word_piece = is_rtl_word_piece(&items, run);
+        // A gap wider than a kern between RTL pieces is a word space: keep
+        // them apart, as plain text on the word's line.
+        let rtl_gap = if run.anchor_on_left {
+            items[run.glyphs[0]].x - item_right(anchor)
+        } else {
+            anchor.x - item_right(&items[*run.glyphs.last().unwrap()])
+        };
+        let spaced_rtl_piece = rtl_word_piece && rtl_gap > anchor.font_size * SCRIPT_RTL_JOIN_GAP;
+        if run.plain || spaced_rtl_piece {
+            let line_y = body_anchor_y[ri];
+            for &g in &run.glyphs {
+                items[g].y = line_y;
+            }
+            continue;
+        }
         let fuse = ((digit_only && digits <= SCRIPT_MAX_FUSED_DIGITS) || rtl_word_piece)
             && marks_ok
             && fusable_anchor_edge(anchor, run.anchor_on_left)
@@ -523,15 +546,28 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             // `baseline_shift` records the offset from the anchor baseline.
             // The head glyph keeps its font, style flags and mcid.
             let anchor_y = body_anchor_y[ri];
-            let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
-            let text: String = run.glyphs.iter().map(|&g| items[g].text.as_str()).collect();
-            let head = &mut items[run.glyphs[0]];
-            head.text = text;
-            head.legacy_symbol_rewrite = legacy_symbol_rewrite;
-            head.width = run_right - head.x;
-            head.baseline_shift = head.y - anchor_y;
-            for &g in &run.glyphs[1..] {
-                remove[g] = true;
+            // Glyphs of different bold or italic stay separate items, so a
+            // style boundary inside the run survives.
+            let mut start = 0;
+            while start < run.glyphs.len() {
+                let style = |g: usize| (items[g].is_bold, items[g].is_italic);
+                let end = run.glyphs[start..]
+                    .iter()
+                    .position(|&g| style(g) != style(run.glyphs[start]))
+                    .map_or(run.glyphs.len(), |n| start + n);
+                let part = &run.glyphs[start..end];
+                let run_right = item_right(&items[*part.last().unwrap()]);
+                let text: String = part.iter().map(|&g| items[g].text.as_str()).collect();
+                let rewrite = part.iter().any(|&g| items[g].legacy_symbol_rewrite);
+                let head = &mut items[part[0]];
+                head.text = text;
+                head.legacy_symbol_rewrite = rewrite;
+                head.width = run_right - head.x;
+                head.baseline_shift = head.y - anchor_y;
+                for &g in &part[1..] {
+                    remove[g] = true;
+                }
+                start = end;
             }
         }
     }
@@ -1046,6 +1082,52 @@ mod tests {
         anchor.is_bold = true;
         let merged = merge_subscript_items(vec![piece, anchor]);
         assert_eq!(texts(&merged), vec!["المادة"]);
+    }
+
+    #[test]
+    fn skipped_bracket_joins_the_word_line_in_markdown() {
+        use crate::markdown::{to_markdown_from_items, MarkdownOptions};
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("(", 124.0, 504.0, 2.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert!(merged.iter().all(|i| (i.y - 500.0).abs() < 1e-3));
+        let md = to_markdown_from_items(merged, MarkdownOptions::default());
+        let line = md.lines().find(|l| l.contains("word")).unwrap();
+        assert!(line.contains('('), "bracket on its own line: {md}");
+        assert!(!md.contains("<sup>"), "{md}");
+    }
+
+    #[test]
+    fn spaced_rtl_pieces_are_not_joined_without_the_space() {
+        // 2.5 pt gap (a word space at this size) between a 6 pt word and a
+        // 12 pt word: separate words on one line, not a script.
+        let items = vec![
+            make_item_fs("של", 100.0, 504.0, 6.0, 6.0),
+            make_item_fs("כותרת", 108.5, 500.0, 30.0, 12.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 2);
+        assert!(merged
+            .iter()
+            .all(|i| i.baseline_shift == 0.0 && (i.y - 500.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn mixed_style_marker_run_keeps_its_style_boundary() {
+        let mut dagger = make_item_fs("†", 127.0, 504.0, 3.0, 6.0);
+        dagger.is_bold = true;
+        let items = vec![
+            make_item_fs("word", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("*", 124.0, 504.0, 3.0, 6.0),
+            dagger,
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(merged.len(), 3);
+        assert_eq!((merged[1].text.as_str(), merged[1].is_bold), ("*", false));
+        assert_eq!((merged[2].text.as_str(), merged[2].is_bold), ("†", true));
+        assert!(merged[1..].iter().all(|i| i.baseline_shift > 0.0));
     }
 
     // ---- Arabic heading regression (firecrawl/firecrawl#5931) ----
