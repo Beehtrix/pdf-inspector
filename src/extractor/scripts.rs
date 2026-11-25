@@ -385,6 +385,49 @@ fn has_rtl_letter(text: &str) -> bool {
         .any(|c| c.is_alphabetic() && crate::text_utils::is_rtl_char(c))
 }
 
+/// Small Arabic/Hebrew letters touching a larger RTL item are a piece of
+/// that word set at another size (the "ال" of an Arabic heading), not a
+/// footnote marker. Bracket-only pieces ("())" of the same headings) count
+/// too. A piece whose bold or italic differs from the anchor stays apart, so
+/// fusing never drops or extends emphasis.
+fn is_rtl_word_piece(items: &[TextItem], run: &ScriptRun) -> bool {
+    let anchor = &items[run.anchor];
+    has_rtl_letter(&anchor.text)
+        && run.glyphs.iter().all(|&g| {
+            let glyph = &items[g];
+            glyph.is_bold == anchor.is_bold
+                && glyph.is_italic == anchor.is_italic
+                && glyph.text.chars().all(|c| {
+                    (c.is_alphabetic() && crate::text_utils::is_rtl_char(c))
+                        || matches!(c, '(' | ')' | '[' | ']' | '{' | '}')
+                })
+        })
+}
+
+/// Text of a fusing run: sub/superscript digits, or plain RTL letters. An
+/// RTL run on the right of its word reads right to left, so its glyphs are
+/// taken in reverse x order.
+fn fused_run_text(
+    items: &[TextItem],
+    run: &ScriptRun,
+    rtl_word_piece: bool,
+    raised: bool,
+) -> String {
+    if !rtl_word_piece {
+        return run
+            .glyphs
+            .iter()
+            .map(|&g| map_script_digits(&items[g].text, raised))
+            .collect();
+    }
+    let texts = run.glyphs.iter().map(|&g| items[g].text.as_str());
+    if run.anchor_on_left {
+        texts.rev().collect()
+    } else {
+        texts.collect()
+    }
+}
+
 /// Fuse digit-only runs into their anchors; flag every other run.
 fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextItem> {
     // A glyph can itself anchor a smaller run (nested scripts: "x", "2",
@@ -436,17 +479,7 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
                 && (anchor.is_underline == glyph.is_underline
                     || (anchor.is_underline && !glyph.is_underline))
         });
-        // Small Arabic/Hebrew letters touching a larger RTL item are a
-        // piece of that word set at another size (the "ال" of an Arabic
-        // heading), not a footnote marker. They rejoin the word as plain
-        // text so the line keeps the anchor's size and stays a heading.
-        // Bracket-only pieces ("())" of the same headings) rejoin likewise.
-        let rtl_word_piece = run.glyphs.iter().all(|&g| {
-            items[g].text.chars().all(|c| {
-                (c.is_alphabetic() && crate::text_utils::is_rtl_char(c))
-                    || matches!(c, '(' | ')' | '[' | ']' | '{' | '}')
-            })
-        }) && has_rtl_letter(&anchor.text);
+        let rtl_word_piece = is_rtl_word_piece(&items, run);
         let fuse = ((digit_only && digits <= SCRIPT_MAX_FUSED_DIGITS) || rtl_word_piece)
             && marks_ok
             && fusable_anchor_edge(anchor, run.anchor_on_left)
@@ -459,17 +492,7 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             // folds both back to plain digits, so downstream text matching
             // is unaffected.
             let raised = items[run.glyphs[0]].y > anchor.y + anchor.font_size * 0.1;
-            let mapped: String = run
-                .glyphs
-                .iter()
-                .map(|&g| {
-                    if rtl_word_piece {
-                        items[g].text.clone()
-                    } else {
-                        map_script_digits(&items[g].text, raised)
-                    }
-                })
-                .collect();
+            let mapped = fused_run_text(&items, run, rtl_word_piece, raised);
             let run_left = items[run.glyphs[0]].x;
             let run_right = item_right(&items[*run.glyphs.last().unwrap()]);
             let anchor = &mut items[run.anchor];
@@ -477,14 +500,16 @@ fn apply_script_runs(mut items: Vec<TextItem>, runs: &[ScriptRun]) -> Vec<TextIt
             // The fused item spans the union of word and marker: a kerned
             // marker may end inside the word's advance or start before it.
             let anchor_right = item_right(anchor);
-            if run.anchor_on_left {
+            let left = anchor.x.min(run_left);
+            anchor.width = anchor_right.max(run_right) - left;
+            anchor.x = left;
+            // Digits read in screen order. RTL pieces read right to left:
+            // one on the right of its word precedes it, one on the left is
+            // already ahead of it in the stream order of the source PDFs.
+            if run.anchor_on_left && !rtl_word_piece {
                 anchor.text.push_str(&mapped);
-                anchor.width = anchor_right.max(run_right) - anchor.x;
             } else {
                 anchor.text = mapped + &anchor.text;
-                let left = anchor.x.min(run_left);
-                anchor.width = anchor_right.max(run_right) - left;
-                anchor.x = left;
             }
             for &g in &run.glyphs {
                 remove[g] = true;
@@ -975,6 +1000,54 @@ mod tests {
         let merged = merge_subscript_items(items);
         assert_eq!(texts(&merged), vec!["a", "b", "second"]);
     }
+    // ---- Review follow-ups ----
+
+    #[test]
+    fn small_hebrew_piece_on_the_right_precedes_its_word() {
+        let items = vec![
+            make_item_fs("ספר", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("ה", 124.0, 504.0, 4.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(texts(&merged), vec!["הספר"]);
+        assert!((merged[0].x - 100.0).abs() < 1e-3);
+        assert!((merged[0].width - 28.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn right_hand_rtl_run_reads_right_to_left() {
+        let items = vec![
+            make_item_fs("ספר", 100.0, 500.0, 24.0, 12.0),
+            make_item_fs("ב", 124.0, 504.0, 3.0, 6.0),
+            make_item_fs("א", 127.0, 504.0, 3.0, 6.0),
+        ];
+        let merged = merge_subscript_items(items);
+        assert_eq!(texts(&merged), vec!["אבספר"]);
+    }
+
+    #[test]
+    fn bold_or_italic_rtl_piece_is_not_fused_into_plain_anchor() {
+        for (bold, italic) in [(true, false), (false, true)] {
+            let mut piece = make_item_fs("ال", 173.6707, 295.9942, 8.9199, 6.996);
+            piece.is_bold = bold;
+            piece.is_italic = italic;
+            let items = vec![piece, make_item_fs("مادة", 182.5865, 291.9982, 30.0, 14.0)];
+            let merged = merge_subscript_items(items);
+            assert_eq!(merged.len(), 2, "bold={bold} italic={italic}");
+            assert!(merged.iter().any(|i| i.text == "مادة"));
+        }
+    }
+
+    #[test]
+    fn matching_bold_rtl_piece_still_fuses() {
+        let mut piece = make_item_fs("ال", 173.6707, 295.9942, 8.9199, 6.996);
+        let mut anchor = make_item_fs("مادة", 182.5865, 291.9982, 30.0, 14.0);
+        piece.is_bold = true;
+        anchor.is_bold = true;
+        let merged = merge_subscript_items(vec![piece, anchor]);
+        assert_eq!(texts(&merged), vec!["المادة"]);
+    }
+
     // ---- Arabic heading regression (firecrawl/firecrawl#5931) ----
     // The PDF sets pieces of a 14 pt heading as 7 pt items raised 4 pt and
     // touching the heading item. They are heading text, not footnote markers.

@@ -18,7 +18,9 @@ version and date. Earlier releases are described in their
   `## المادة الأولى:` stay headings. Latin and CJK footnote markers are
   unchanged; a raised bracket-only item beside non-RTL text is no longer a
   script, and a raised Arabic or Hebrew letter marker beside a larger RTL
-  word is now read as part of that word (firecrawl/firecrawl#5931).
+  word is now read as part of that word, in right-to-left order when the
+  piece sits on the right, and only when its bold and italic match the word's
+  (firecrawl/firecrawl#5931).
 
 ## [1.27.1] - 2026-11-24
 
