@@ -628,14 +628,24 @@ fn list_marker_bracket(chars: &[char]) -> Option<usize> {
 /// inverted pair: `1) ו (שלום)` keeps its nested reading.
 fn inverted_bracket_positions(chars: &[char], shown: &[bool]) -> Vec<bool> {
     let shown_at = |i: usize| shown.get(i).copied().unwrap_or(false);
+    // A complete pair with a shown end is the display's own, `(ABC)` whose
+    // `(` came from replacement text: its other end is no backwards pair's.
+    let whole = match_brackets(chars, false, |_| false);
+    let held = mark_pairs(
+        chars.len(),
+        &whole
+            .into_iter()
+            .filter(|&(l, r)| shown_at(l) || shown_at(r))
+            .collect::<Vec<_>>(),
+    );
     let nested = match_brackets(chars, false, shown_at);
     let nested_marks = mark_pairs(chars.len(), &nested);
-    let leftover = match_brackets(chars, true, |i| shown_at(i) || nested_marks[i]);
+    let leftover = match_brackets(chars, true, |i| shown_at(i) || nested_marks[i] || held[i]);
     let leftover_marks = mark_pairs(chars.len(), &leftover);
     // A bracket that finds a partner among the leftovers is a pair's own,
     // `)א(2` stored by role, and no list marker.
     let marker = list_marker_bracket(chars).filter(|&at| !leftover_marks[at]);
-    let all = match_brackets(chars, true, |i| shown_at(i) || marker == Some(i));
+    let all = match_brackets(chars, true, |i| shown_at(i) || held[i] || marker == Some(i));
     let span = |found: &[(usize, usize)]| found.iter().map(|&(l, r)| r - l).sum::<usize>();
     let mixed_count = nested.len() + leftover.len();
     let mixed_span = span(&nested) + span(&leftover);
@@ -656,22 +666,25 @@ fn inverted_bracket_positions(chars: &[char], shown: &[bool]) -> Vec<bool> {
 /// as storing by role when more of its pairs read `)…(` than `(…)`. Pairs
 /// around Latin text read `(…)` whichever way the page stores brackets, so
 /// they say nothing and their brackets are not paired backwards with
-/// others: `(ABC) א (DEF)` has no backwards pair.
+/// others: `(ABC) א (DEF)` has no backwards pair. The same goes for a pair
+/// around punctuation alone: `(+)` reads the same either way, so `(+) א (-)`
+/// has none either. Only pairs around right-to-left letters or digits count
+/// as drawn.
 pub(crate) fn brackets_stored_by_role<'a>(lines: impl IntoIterator<Item = &'a [char]>) -> bool {
     let mut backwards = 0;
     let mut drawn = 0;
     for chars in lines {
-        let mut latin = vec![false; chars.len()];
+        let mut held = vec![false; chars.len()];
         for (open, close) in match_brackets(chars, false, |_| false) {
             let inside = &chars[open + 1..close];
-            if encloses_latin(inside) {
-                latin[open] = true;
-                latin[close] = true;
-            } else if encloses_right_to_left(inside) {
+            if encloses_right_to_left(inside) {
                 drawn += 1;
+            } else if inside.iter().any(|c| !c.is_whitespace()) {
+                held[open] = true;
+                held[close] = true;
             }
         }
-        backwards += match_brackets(chars, true, |i| latin[i]).len();
+        backwards += match_brackets(chars, true, |i| held[i]).len();
     }
     backwards > drawn
 }
@@ -1490,6 +1503,38 @@ mod tests {
         );
         // Unexempt, the same line comes out with inverted pairs.
         assert_ne!(read(&[]), ["(1)", "(1)", "(2)", "(2)"]);
+    }
+
+    #[test]
+    fn punctuation_only_pairs_do_not_feed_the_backwards_vote() {
+        // `(+) א (-)` has no pair around letters, and the `)` and `(` that
+        // face each other across its Hebrew letter are no pair stored by
+        // role. Beside the one mirrored pair `(ו) ה (ז)` and the wrapped
+        // `)דג בא(` the page draws its pairs mirrored.
+        assert!(!page_stores_by_role(&["(+) \u{05D0} (-)"]));
+        assert!(!page_stores_by_role(&[
+            "(+) \u{05D0} (-)",
+            ")\u{05D3}\u{05D2} \u{05D1}\u{05D0}(",
+            "(\u{05D5}) \u{05D4} (\u{05D6})",
+        ]));
+        // Pairs around letters still decide.
+        assert!(page_stores_by_role(&[")\u{05D5}( \u{05D4} )\u{05D6}("]));
+    }
+
+    #[test]
+    fn a_shown_bracket_leaves_its_latin_pair_out_of_backwards_pairs() {
+        // `(ABC) (DEF) בא` with the first `(` from replacement text: the
+        // `)` closing ABC and the `(` opening DEF are no backwards pair.
+        let display = "(ABC) (DEF) \u{05D1}\u{05D0}";
+        let shown = [true, false, false, false, false];
+        let read = |shown: &[bool]| -> String {
+            visual_to_logical(&visual(display), true, Some(shown))
+                .into_iter()
+                .map(|v| v.ch)
+                .collect()
+        };
+        assert_eq!(read(&shown), read(&[]));
+        assert_eq!(read(&shown), "\u{05D0}\u{05D1} (DEF) (ABC)");
     }
 
     #[test]
