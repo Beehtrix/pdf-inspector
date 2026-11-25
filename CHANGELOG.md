@@ -16,14 +16,13 @@ version and date. Earlier releases are described in their
   bracket-only item such as `())`) into `<sup>` markers. They rejoin the
   neighbouring larger RTL item as plain text, so headings like
   `## المادة الأولى:` stay headings. Latin and CJK footnote markers are
-  unchanged; a raised bracket-only item beside non-RTL text is no longer a
-  script, and a raised Arabic or Hebrew letter marker beside a larger RTL
-  word is now read as part of that word, in right-to-left order when the
-  piece sits on the right, only when its bold and italic match the word's,
-  and only when nothing wider than a kern separates them (a wider gap is a
-  word space, so the pieces stay apart on the same line). A skipped bracket
-  stays on its neighbour's line, and a marker run mixing bold or italic keeps
-  that boundary (firecrawl/firecrawl#5931).
+  unchanged. A raised bracket-only item and a small Arabic or Hebrew piece
+  that touches the Arabic/Hebrew end of a larger word are plain text, joined
+  to it in right-to-left order when the piece sits on the right, with a
+  space when a word gap separates them, and only when their bold and italic
+  match. A piece touching the Latin end of a mixed-direction item stays a
+  script. Pieces that cannot join keep their painted position and are not
+  flagged (firecrawl/firecrawl#5931).
 
 ## [1.27.1] - 2026-11-24
 
